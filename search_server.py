@@ -26,6 +26,10 @@ def extract_api_key():
         return request.headers.get("x-api-key").strip()
     if request.args.get("api_key"):
         return request.args.get("api_key").strip()
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        if data.get("api_key"):
+            return str(data.get("api_key")).strip()
     return None
 
 def require_auth():
@@ -56,6 +60,7 @@ def root():
     }), 200
 
 @app.route("/health", methods=["GET"])
+@app.route("/status", methods=["GET"])
 def health():
     return jsonify({
         "status": "healthy",
@@ -145,7 +150,7 @@ def serpapi_search():
     # 1. Try Real Headless Chromium Sandbox
     if chromium_driver.ensure_chromium_running():
         try:
-            result = chromium_driver.search_google(query, num=num)
+            result = chromium_driver.search_google(query, num=num, engine=engine)
             if result.get("organic_results"):
                 return jsonify(result)
         except Exception as e:

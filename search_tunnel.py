@@ -146,7 +146,7 @@ def start_tunnel():
     current_url = None
     try:
         current_process = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", "http://localhost:3001"],
+            ["cloudflared", "tunnel", "--url", "http://127.0.0.1:3001"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True

@@ -1,0 +1,12 @@
+{
+  "name": "ntawebsearch",
+  "version": "1.0.0",
+  "description": "NTA Sovereign WebSearch API Cloudflare Pages Gateway",
+  "main": "functions/[[path]].js",
+  "scripts": {
+    "build": "echo 'Build successful: Static assets and Cloudflare Pages Functions ready'"
+  },
+  "keywords": ["websearch", "serpapi", "sovereign", "edge"],
+  "author": "Beeta-inc",
+  "license": "ISC"
+}

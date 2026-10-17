@@ -139,6 +139,8 @@ class AuthManager:
                     "name": info.get("name", "Key"),
                     "prefix": info.get("prefix", "nta_live_..."),
                     "suffix": info.get("suffix", "..."),
+                    "masked_key": f"{info.get('prefix', 'nta_live_...')}****{info.get('suffix', '')}",
+                    "requests_total": info.get("query_count", 0),
                     "created_at": info.get("created_at"),
                     "last_used": info.get("last_used"),
                     "query_count": info.get("query_count", 0),
