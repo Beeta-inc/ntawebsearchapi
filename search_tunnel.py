@@ -157,12 +157,87 @@ def start_tunnel():
     except Exception as e:
         print(f"[!] Error starting cloudflared for search: {e}", flush=True)
 
+def ensure_search_server_running():
+    """Verifies search_server.py is listening on port 3001; respawns if crashed."""
+    import socket
+    try:
+        s = socket.create_connection(("127.0.0.1", 3001), timeout=1)
+        s.close()
+        return True
+    except Exception:
+        pass
+
+    print("[SEARCH-WATCHDOG] ⚠️ search_server.py is not listening on port 3001! Resurrecting...", flush=True)
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    subprocess.run(["pkill", "-9", "-f", "ntawebsearchapi/search_server\\.py"], capture_output=True)
+    time.sleep(1)
+    try:
+        log_out = open(os.path.join(repo_dir, "search_server.log"), "a")
+        subprocess.Popen(
+            [sys.executable, os.path.join(repo_dir, "search_server.py")],
+            cwd=repo_dir,
+            stdout=log_out,
+            stderr=subprocess.STDOUT
+        )
+        time.sleep(2)
+        return True
+    except Exception as e:
+        print(f"[SEARCH-WATCHDOG] Error spawning search_server.py: {e}", flush=True)
+        return False
+
+def ensure_chromium_running():
+    """Verifies headless Chromium CDP is listening on port 9222; launches if inactive."""
+    import socket
+    try:
+        s = socket.create_connection(("127.0.0.1", 9222), timeout=1)
+        s.close()
+        return True
+    except Exception:
+        pass
+
+    print("[SEARCH-WATCHDOG] 🌐 Launching fresh Chromium CDP sandbox on port 9222...", flush=True)
+    subprocess.run(["pkill", "-9", "-f", "chromium.*9222"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "chrome.*9222"], capture_output=True)
+    time.sleep(1)
+
+    chrome_bin = shutil.which("chromium") or shutil.which("chrome") or shutil.which("chromium-browser")
+    if not chrome_bin:
+        for p in ["/data/data/com.termux/files/usr/bin/chromium", "/data/data/com.termux/files/usr/bin/chrome"]:
+            if os.path.exists(p):
+                chrome_bin = p
+                break
+    if chrome_bin:
+        cmd = [
+            chrome_bin,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--remote-debugging-port=9222",
+            "--remote-debugging-address=127.0.0.1",
+            "--user-data-dir=" + os.path.expanduser("~/.config/nta-chromium-sandbox"),
+            "--window-size=1280,800",
+            "--blink-settings=imagesEnabled=false",
+            "--disable-blink-features=AutomationControlled",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "about:blank"
+        ]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"[SEARCH-WATCHDOG] Error launching Chromium: {e}", flush=True)
+    return False
+
 def restart_search_stack():
-    """Restarts search_server.py and cloudflared tunnel upon network recovery."""
+    """Restarts search_server.py, Chromium CDP, and cloudflared tunnel upon network recovery."""
     global current_process, current_url, last_pushed_url
-    print("\n[SEARCH-WATCHDOG] 🔄 Restarting search server and tunnel...", flush=True)
+    print("\n[SEARCH-WATCHDOG] 🔄 Full search stack recovery initiated...", flush=True)
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
+    # 1. Terminate search tunnel only
     if current_process:
         try:
             current_process.terminate()
@@ -170,15 +245,43 @@ def restart_search_stack():
         except Exception:
             pass
         current_process = None
+    subprocess.run(["pkill", "-9", "-f", "cloudflared.*3001"], capture_output=True)
 
-    subprocess.run(["pkill", "-f", "search_server.py"], capture_output=True)
-    time.sleep(1.5)
+    # 2. Terminate search server only
+    subprocess.run(["pkill", "-9", "-f", "ntawebsearchapi/search_server\\.py"], capture_output=True)
 
+    # 3. Re-assert Termux wake lock
+    try:
+        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+    # 4. Restart Chromium to flush DNS caches
+    ensure_chromium_running()
+    time.sleep(1)
+
+    # 5. Spawn fresh search_server.py
     try:
         log_out = open(os.path.join(repo_dir, "search_server.log"), "a")
-        subprocess.Popen([sys.executable, os.path.join(repo_dir, "search_server.py")], cwd=repo_dir, stdout=log_out, stderr=subprocess.STDOUT)
+        subprocess.Popen(
+            [sys.executable, os.path.join(repo_dir, "search_server.py")],
+            cwd=repo_dir,
+            stdout=log_out,
+            stderr=subprocess.STDOUT
+        )
     except Exception as e:
         print(f"[SEARCH-WATCHDOG] Error spawning search_server.py: {e}", flush=True)
+
+    # 6. Wait for port 3001
+    import socket
+    for _ in range(15):
+        time.sleep(1)
+        try:
+            s = socket.create_connection(("127.0.0.1", 3001), timeout=1)
+            s.close()
+            break
+        except Exception:
+            pass
 
     current_url = None
     last_pushed_url = None
@@ -187,22 +290,41 @@ def restart_search_stack():
 def run_search_coordinator():
     global current_process, current_url, last_pushed_url
     print(f"Starting NTA WebSearch Tunnel Supervisor. Device ID: {DEVICE_ID}", flush=True)
+
+    try:
+        subprocess.run(["termux-wake-lock"], capture_output=True, timeout=2)
+    except Exception:
+        pass
+
+    ensure_chromium_running()
+    ensure_search_server_running()
     start_tunnel()
 
     while True:
+        # 1. 🌐 Network Watchdog
         if not is_network_online(timeout=1.5):
             wait_for_network_recovery()
             restart_search_stack()
             continue
 
-        if current_url and current_url != last_pushed_url:
-            update_firestore_search_tunnel(current_url)
-            last_pushed_url = current_url
+        # 2. 🛡️ Local Search Server Watchdog (Port 3001)
+        ensure_search_server_running()
 
-        if current_process and current_process.poll() is not None:
-            print("Search tunnel died. Restarting...", flush=True)
+        # 3. 🌐 Chromium CDP Watchdog (Port 9222)
+        ensure_chromium_running()
+
+        # 4. 🛡️ Search Tunnel Process Liveness Watchdog (Port 3001)
+        if current_process is None or current_process.poll() is not None:
+            print("[SEARCH-WATCHDOG] ⚠️ Search tunnel inactive/crashed. Respawning...", flush=True)
             current_process = None
             start_tunnel()
+
+        if current_url:
+            if current_url != last_pushed_url:
+                update_firestore_search_tunnel(current_url)
+                last_pushed_url = current_url
+            else:
+                update_firestore_search_tunnel(current_url)
 
         time.sleep(10)
 
@@ -212,3 +334,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         if current_process:
             current_process.terminate()
+            subprocess.run(["pkill", "-f", "cloudflared.*3001"])
