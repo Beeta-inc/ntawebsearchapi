@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+*.tmp
+*.log
+search_keys.json
+data/

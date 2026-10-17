@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NTA WebSearch API — Official Documentation & Integration Guide</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #070b13;
+            --card: #0f172a;
+            --border: #1e293b;
+            --cyan: #00f3ff;
+            --emerald: #10b981;
+            --amber: #f59e0b;
+            --purple: #a855f7;
+            --blue: #3b82f6;
+            --text-sub: #94a3b8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--bg);
+            color: #f8fafc;
+            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            padding: 30px 20px;
+            max-width: 1080px;
+            margin: 0 auto;
+            line-height: 1.6;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 24px;
+            margin-bottom: 32px;
+        }
+        .brand { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; }
+        .brand span { color: var(--cyan); }
+        .badge {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            background: rgba(0, 243, 255, 0.1);
+            color: var(--cyan);
+            border: 1px solid rgba(0, 243, 255, 0.2);
+        }
+        h2 { font-size: 19px; font-weight: 700; margin: 32px 0 16px 0; color: #fff; display: flex; align-items: center; gap: 8px; }
+        h3 { font-size: 15px; font-weight: 600; margin: 20px 0 10px 0; color: var(--cyan); }
+        p, li { color: var(--text-sub); font-size: 14px; margin-bottom: 12px; }
+        ul { padding-left: 24px; margin-bottom: 16px; }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        pre {
+            background: #030712;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            overflow-x: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12.5px;
+            color: #e2e8f0;
+            margin: 12px 0 20px 0;
+            line-height: 1.5;
+        }
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            background: rgba(255, 255, 255, 0.08);
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #fff;
+        }
+        .method-tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 3px 8px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .get { background: rgba(59, 130, 246, 0.2); color: var(--blue); border: 1px solid var(--blue); }
+        .post { background: rgba(16, 185, 129, 0.2); color: var(--emerald); border: 1px solid var(--emerald); }
+        .table-wrap { overflow-x: auto; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+        th, td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+        th { font-family: 'JetBrains Mono', monospace; color: var(--text-sub); font-size: 11px; text-transform: uppercase; }
+        td { color: #e2e8f0; }
+        .highlight { color: var(--emerald); font-weight: 600; }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <div class="brand">⚡ NTA <span>WebSearch API</span></div>
+            <p style="margin-bottom:0; font-size:12px;">Sovereign Real-Browser Search & Deep Scraping Node</p>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+            <span class="badge">v1.0 Sovereign Native</span>
+            <a href="https://ntamediaserver.pages.dev" style="color:var(--cyan); font-size:13px; font-weight:700; text-decoration:none;">Dashboard ↗</a>
+        </div>
+    </header>
+
+    <div class="card" style="border-left: 4px solid var(--cyan);">
+        <h3 style="margin-top:0; color:#fff;">🚀 Enterprise Architecture Summary</h3>
+        <p style="margin-bottom:0;">
+            NTA WebSearch API is hosted natively on your dedicated Lenovo 4GB hardware server in Termux (<code>aarch64</code>), executing a real headless <strong>Chromium Sandbox with Chrome DevTools Protocol (CDP)</strong> and high-speed Chrome TLS impersonation. It provides <strong>100% drop-in compatibility with SerpAPI</strong>, completely eliminating third-party subscription costs and monthly quota exhaustion.
+        </p>
+    </div>
+
+    <h2>🔑 1. API Key Authentication</h2>
+    <p>All endpoints accept your sovereign API key via either an HTTP Header or Query Parameter:</p>
+    <ul>
+        <li><strong>HTTP Header (Recommended):</strong> <code>Authorization: Bearer nta_live_...</code> or <code>x-api-key: nta_live_...</code></li>
+        <li><strong>Query Parameter:</strong> <code>https://ntawebsearch.pages.dev/search?q=...&api_key=nta_live_...</code></li>
+    </ul>
+    <p>Keys are created via <code>POST /createapi</code> or via the GUI on <a href="https://ntamediaserver.pages.dev" style="color:var(--cyan)">ntamediaserver.pages.dev</a>. Keys follow the <strong>One-Time Reveal</strong> security protocol: the raw key is displayed once upon generation and stored only as a SHA-256 hash on the phone.</p>
+
+    <h2>📖 2. Complete Endpoints Reference</h2>
+
+    <div class="card">
+        <span class="method-tag get">GET</span> <code>/search</code> & <code>/search.json</code>
+        <h3>100% Drop-In SerpAPI Compatible Endpoint</h3>
+        <p>Drop-in replacement for SerpAPI in existing codebases. Returns the exact SerpAPI JSON schema.</p>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>q</code></td><td>String (Required)</td><td>-</td><td>Search query keywords</td></tr>
+                    <tr><td><code>engine</code></td><td>String</td><td><code>google</code></td><td><code>google</code> or <code>google_images</code></td></tr>
+                    <tr><td><code>tbs</code></td><td>String</td><td>-</td><td>Pass <code>itp:animated</code> to filter animated GIFs</td></tr>
+                    <tr><td><code>num</code></td><td>Integer</td><td><code>10</code></td><td>Number of results to extract (1-30)</td></tr>
+                    <tr><td><code>api_key</code></td><td>String</td><td>-</td><td>Your <code>nta_live_...</code> key</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <p><strong>Example Request:</strong></p>
+        <pre>curl -s "https://ntawebsearch.pages.dev/search?q=RTX+5090+specs&engine=google&api_key=YOUR_KEY"</pre>
+        <p><strong>Example Response:</strong></p>
+        <pre>{
+  "search_metadata": {
+    "status": "Success",
+    "total_time_taken": 0.38,
+    "engine": "sovereign_chromium_sandbox"
+  },
+  "search_parameters": { "q": "RTX 5090 specs", "engine": "google" },
+  "organic_results": [
+    {
+      "position": 1,
+      "title": "NVIDIA GeForce RTX 5090 Specs & Details",
+      "link": "https://videocardz.com/newz/nvidia-geforce-rtx-5090",
+      "snippet": "The GeForce RTX 5090 features 32GB of GDDR7 memory...",
+      "source": "videocardz.com"
+    }
+  ]
+}</pre>
+    </div>
+
+    <div class="card">
+        <span class="method-tag post">POST</span> <code>/api/search</code>
+        <h3>Modern AI Agent Search Endpoint</h3>
+        <p>Tailored specifically for LLM Chat AIs (NeTuArk AI). Extracts organic results and formats pre-ranked BM25 text observations ready for direct prompt injection.</p>
+        <p><strong>Payload:</strong></p>
+        <pre>{
+  "query": "Who built NeTuArk app?",
+  "max_sources": 6,
+  "include_images": true
+}</pre>
+    </div>
+
+    <div class="card">
+        <span class="method-tag post">POST</span> <code>/api/scrape</code>
+        <h3>Real Browser Dynamic Page Scraper</h3>
+        <p>Executes client-side JavaScript inside the real Chromium sandbox (handles React, Next.js, Angular, Twitter/X, Reddit, SPAs) and returns clean text.</p>
+        <p><strong>Payload:</strong></p>
+        <pre>{ "url": "https://news.ycombinator.com" }</pre>
+    </div>
+
+    <h2>💻 3. Step-by-Step App Implementation Guide</h2>
+
+    <h3>A. Web App (`glowing-carnival`) — Backend (`backend/server.js`)</h3>
+    <p>Replace the hardcoded SerpAPI call (around line 1274) with your sovereign search gateway:</p>
+    <pre>// BEFORE (SerpAPI):
+// const serpRes = await axios.get(`https://serpapi.com/search?q=${encodeURIComponent(query)}&api_key=${serpapiKey}&engine=google`);
+
+// AFTER (NTA Sovereign WebSearch):
+const NTA_SEARCH_KEY = process.env.NTA_SEARCH_KEY || 'YOUR_NTA_LIVE_KEY';
+const searchRes = await axios.get(`https://ntawebsearch.pages.dev/search`, {
+  params: {
+    q: query,
+    engine: 'google',
+    api_key: NTA_SEARCH_KEY
+  },
+  timeout: 8000
+});
+const organicResults = searchRes.data?.organic_results || [];</pre>
+
+    <h3>B. Web App (`glowing-carnival`) — Cloudflare Worker (`_worker.js`)</h3>
+    <p>Replace SerpAPI in the GIF search endpoint (around line 2209) and AI search endpoint:</p>
+    <pre>// Dedicated GIF Search Endpoint in _worker.js
+if (path === '/api/gifs') {
+  const q = url.searchParams.get('q') || 'trending';
+  const apiKey = env.NTA_SEARCH_KEY || 'YOUR_NTA_LIVE_KEY';
+  const searchUrl = `https://ntawebsearch.pages.dev/search.json?q=${encodeURIComponent(q + ' site:giphy.com OR site:tenor.com OR gif')}&engine=google_images&tbs=itp:animated&api_key=${apiKey}&num=24`;
+  
+  const resp = await fetch(searchUrl);
+  if (resp.ok) {
+    const data = await resp.json();
+    return new Response(JSON.stringify({ gifs: data.images_results || [] }), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+}</pre>
+
+    <h3>C. Android App (`nta-app-try1`) — Kotlin Integration</h3>
+    <p>In `NetuarkAiService.kt`, query the sovereign API directly to offload heavy browser scraping from mobile battery:</p>
+    <pre>suspend fun querySovereignWebSearch(query: String, apiKey: String): String = withContext(Dispatchers.IO) {
+    val url = "https://ntawebsearch.pages.dev/api/search"
+    val payload = JSONObject().apply {
+        put("query", query)
+        put("max_sources", 6)
+        put("include_images", true)
+    }
+    
+    val conn = URL(url).openConnection() as HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.setRequestProperty("Authorization", "Bearer $apiKey")
+    conn.doOutput = true
+    conn.outputStream.use { it.write(payload.toString().toByteArray()) }
+
+    if (conn.responseCode == 200) {
+        val responseJson = conn.inputStream.bufferedReader().use { it.readText() }
+        val data = JSONObject(responseJson)
+        return@withContext data.optString("observation", "")
+    }
+    return@withContext ""
+}</pre>
+
+    <h2>🛡️ 4. Security & Best Practices</h2>
+    <ul>
+        <li><strong>Zero Data Leakage:</strong> Search queries are processed in your personal sandbox, not indexed by commercial ad trackers.</li>
+        <li><strong>Automatic Failover:</strong> If the Chromium sandbox is busy rendering a complex dynamic page, queries seamlessly fallback to the sub-second Multi-Engine TLS scraper.</li>
+        <li><strong>Process Supervision:</strong> Termux automatically recycles Chromium tabs after each query to keep the device RAM under 80 MB.</li>
+    </ul>
+</body>
+</html>
