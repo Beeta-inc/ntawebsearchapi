@@ -185,6 +185,7 @@ def restart_search_stack():
     start_tunnel()
 
 def run_search_coordinator():
+    global current_process, current_url, last_pushed_url
     print(f"Starting NTA WebSearch Tunnel Supervisor. Device ID: {DEVICE_ID}", flush=True)
     start_tunnel()
 
