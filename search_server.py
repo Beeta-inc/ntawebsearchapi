@@ -205,7 +205,13 @@ def ai_search():
         results = res.get("organic_results", [])
         engine_used = "multi_engine_tls_fallback"
 
-    observation_text = direct_search_engine.build_ai_observation(results)
+    observation_text = (res or {}).get("observation") or direct_search_engine.build_ai_observation(
+        organic_results=results,
+        answer_box=(res or {}).get("answer_box"),
+        knowledge_graph=(res or {}).get("knowledge_graph"),
+        top_stories=(res or {}).get("top_stories"),
+        query=query
+    )
     images = []
     if include_images:
         try:
@@ -249,12 +255,25 @@ def scrape_endpoint():
     # Static fallback
     raw_html = direct_search_engine.make_http_request(url, timeout=5.0)
     clean_text = direct_search_engine.clean_html(raw_html or "")
+    links = []
+    if raw_html:
+        for a_match in re.finditer(r'<a\s+[^>]*href=["\'](https?://[^"\']+)["\'][^>]*>(.*?)</a>', raw_html, re.IGNORECASE):
+            u = a_match.group(1)
+            t = direct_search_engine.clean_html(a_match.group(2))
+            if t and len(t) > 10 and not any(l["url"] == u for l in links):
+                links.append({"title": t[:100], "url": u})
+                if len(links) >= 30:
+                    break
+
     return jsonify({
         "success": bool(raw_html),
         "url": url,
         "title": url,
         "content_text": clean_text[:12000],
-        "word_count": len(clean_text.split())
+        "text": clean_text[:12000],
+        "word_count": len(clean_text.split()),
+        "links": links,
+        "headlines": [l["title"] for l in links if len(l["title"]) > 15]
     })
 
 # ── 6. API Key Management (/createapi and /api/keys) ──

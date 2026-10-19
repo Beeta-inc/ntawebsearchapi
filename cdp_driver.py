@@ -293,11 +293,7 @@ class RealChromiumSandboxDriver:
 
             # Determine initial target URL
             clean_engine = engine.lower().strip()
-            if clean_engine == "bing":
-                initial_url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}&setlang=en-US"
-            else:
-                initial_url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}&setlang=en-US"
-
+            initial_url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(query)}"
             client.call_cdp("Page.navigate", {"url": initial_url})
 
             # Wait for search results container to be populated (up to 3.5s)
@@ -322,15 +318,15 @@ class RealChromiumSandboxDriver:
                 let answerBox = null;
                 let knowledgeGraph = null;
 
-                // 1. Direct Answer Box (Calculations, Weather, Definitions)
-                const ansEl = document.querySelector('.b_ans, .b_topTitle, .b_focusTextExtra, [data-tts="answers"], .kp-blk, .xpdopen');
+                // 1. Direct Answer Box (Calculations, Weather, Definitions, Dates, Calendars)
+                const ansEl = document.querySelector('.b_ans, .b_topTitle, .b_focusTextLarge, .b_focusTextExtra, .b_algoBigText, .rw-snippet, [data-tts="answers"], .kp-blk, .xpdopen, .Z0LcW, .LGOjhe, .hgKElc, div[data-attrid="wa:/description"]');
                 if (ansEl) {
-                    const h = ansEl.querySelector('h2, h3, .b_entityTitle, .bNeawe');
-                    const txt = (ansEl.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (txt.length > 5 && !txt.includes('b_ans')) {
+                    const h = ansEl.querySelector('h2, h3, .b_entityTitle, .bNeawe, .b_focusTextLarge, .b_topTitle');
+                    const txt = (ansEl.innerText || ansEl.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (txt.length > 3) {
                         answerBox = {
-                            title: h ? h.textContent.trim() : 'Quick Answer',
-                            answer: txt.slice(0, 400)
+                            title: h ? (h.innerText || h.textContent || '').trim() : 'Featured Answer',
+                            answer: txt.slice(0, 600)
                         };
                     }
                 }
@@ -350,12 +346,52 @@ class RealChromiumSandboxDriver:
                     }
                 }
 
-                // 3. Organic Search Results
+                // 3. Top Stories / News Carousel
+                const topStories = [];
+                const seenStoryLinks = new Set();
+                document.querySelectorAll('.b_mwsNews, .news-card, li.b_ans[data-mws], div[data-sokoban-container] div.n0jPhd, .WlydOe, div[data-hveid] a[data-ved], .b_ans .news-item').forEach(card => {
+                    const h = card.querySelector('h3, h2, .b_title, .n0jPhd, a');
+                    const l = card.querySelector('a[href^="http"]') || (card.tagName === 'A' ? card : null);
+                    const snip = card.querySelector('.snippet, .b_snippet, .Y3v8qd, .GI74Re, p');
+                    const timeEl = card.querySelector('time, .b_attribution, .OSrXXb, span.f, .b_secondaryText');
+                    if (h && l) {
+                        const t = (h.innerText || h.textContent || '').trim();
+                        let u = l.href;
+                        if (u.includes('bing.com/ck/a?')) {
+                            try {
+                                const uParam = new URL(u).searchParams.get('u');
+                                if (uParam && uParam.startsWith('a1')) {
+                                    const b64 = uParam.substring(2);
+                                    const decoded = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+                                    if (decoded.startsWith('http')) u = decoded;
+                                }
+                            } catch(e) {}
+                        }
+                        const s = snip ? (snip.innerText || snip.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+                        const tm = timeEl ? (timeEl.innerText || timeEl.textContent || '').trim() : '';
+                        if (t && u && !seenStoryLinks.has(u) && !u.includes('bing.com/search') && !u.includes('google.com/search')) {
+                            seenStoryLinks.add(u);
+                            let src = '';
+                            try { src = new URL(u).hostname.replace(/^www\\./, ''); } catch(e) {}
+                            topStories.push({
+                                title: t,
+                                link: u,
+                                snippet: s,
+                                source: src,
+                                date: tm
+                            });
+                        }
+                    }
+                });
+
+                // 4. Organic Search Results
                 const cards = document.querySelectorAll('li.b_algo, #rso .g, #search .g');
                 cards.forEach(card => {
                     const titleEl = card.querySelector('h2, h3');
                     const linkEl = card.querySelector('h2 a, h3 a, a[href^="http"]');
                     const snippetEl = card.querySelector('.b_caption p, .b_algoSlug, .VwiC3b, [style*="-webkit-line-clamp"], p');
+                    const dateEl = card.querySelector('.b_attribution, .c_date, .c_meta, time, span.f');
+                    const date = dateEl ? (dateEl.innerText || dateEl.textContent || '').trim() : '';
 
                     if (titleEl && linkEl) {
                         const title = (titleEl.textContent || '').trim();
@@ -384,13 +420,14 @@ class RealChromiumSandboxDriver:
                                 title: title,
                                 link: link,
                                 snippet: snippet,
-                                source: source
+                                source: source,
+                                date: date
                             });
                         }
                     }
                 });
 
-                // 4. Related Searches
+                // 5. Related Searches
                 const related = [];
                 document.querySelectorAll('.b_rs a, .b_rsv2 a, a.k8XOCe').forEach(el => {
                     const q = (el.textContent || '').trim();
@@ -403,6 +440,7 @@ class RealChromiumSandboxDriver:
                     results: results.slice(0, 20),
                     answer_box: answerBox,
                     knowledge_graph: knowledgeGraph,
+                    top_stories: topStories.slice(0, 8),
                     related_searches: related.slice(0, 8),
                     page_title: document.title
                 };
@@ -413,7 +451,48 @@ class RealChromiumSandboxDriver:
             organic_results = val.get("results", [])
             answer_box = val.get("answer_box")
             knowledge_graph = val.get("knowledge_graph")
+            top_stories = val.get("top_stories", [])
             related_searches = val.get("related_searches", [])
+
+            # Import aggregator helper for live intelligence enrichment
+            from direct_scraper import direct_search_engine
+
+            # News Enrichment: if query is news-related and top_stories is empty, pull live Google News RSS
+            if direct_search_engine.is_news_query(query) and not top_stories:
+                try:
+                    rss_stories = direct_search_engine.search_news_rss(query, limit=6)
+                    if rss_stories:
+                        top_stories = rss_stories
+                except Exception:
+                    pass
+
+            # Definition Enrichment: if query is encyclopedic and knowledge_graph empty, pull Wikipedia
+            if direct_search_engine.is_definition_query(query) and not knowledge_graph:
+                try:
+                    wiki_entries = direct_search_engine.search_wikipedia_opensearch(query)
+                    if wiki_entries:
+                        knowledge_graph = {
+                            "title": wiki_entries[0]["title"].replace("Wikipedia: ", ""),
+                            "description": wiki_entries[0]["snippet"],
+                            "source": "Wikipedia"
+                        }
+                except Exception:
+                    pass
+
+            # Deep scan top organic result webpages concurrently on the server
+            try:
+                direct_search_engine.enrich_with_deep_page_content(organic_results[:4], query=query)
+            except Exception:
+                pass
+
+            # Build comprehensive LLM observation
+            observation = direct_search_engine.build_ai_observation(
+                organic_results=organic_results[:num],
+                answer_box=answer_box,
+                knowledge_graph=knowledge_graph,
+                top_stories=top_stories if top_stories else None,
+                query=query
+            )
 
             elapsed = round(time.time() - start_time, 2)
             resp = {
@@ -430,12 +509,15 @@ class RealChromiumSandboxDriver:
                     "num": num
                 },
                 "organic_results": organic_results[:num],
-                "related_searches": related_searches
+                "related_searches": related_searches,
+                "observation": observation
             }
             if answer_box:
                 resp["answer_box"] = answer_box
             if knowledge_graph:
                 resp["knowledge_graph"] = knowledge_graph
+            if top_stories:
+                resp["top_stories"] = top_stories
             return resp
         finally:
             client.close()
@@ -576,8 +658,10 @@ class RealChromiumSandboxDriver:
                 "url": url,
                 "title": val.get("title", ""),
                 "content_text": val.get("text", ""),
+                "text": val.get("text", ""),
                 "word_count": val.get("word_count", 0),
-                "links": val.get("links", [])
+                "links": val.get("links", []),
+                "headlines": [l.get("title") for l in val.get("links", []) if len(l.get("title", "")) > 15]
             }
         finally:
             client.close()
