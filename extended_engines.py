@@ -560,19 +560,56 @@ class YouTubeEngine:
                                 thumbs = v.get("thumbnail", {}).get("thumbnails", [])
                                 thumb_url = thumbs[-1].get("url") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
 
+                                # Extract channel URL and badge (authority)
+                                channel_badge = ""
+                                for b in v.get("ownerBadges", []):
+                                    mbr = b.get("metadataBadgeRenderer", {})
+                                    tooltip = mbr.get("tooltip", "")
+                                    if tooltip:
+                                        channel_badge = tooltip
+                                        break
+
+                                channel_url = ""
+                                try:
+                                    runs = v.get("ownerText", {}).get("runs", [])
+                                    if runs:
+                                        nav = runs[0].get("navigationEndpoint", {}).get("browseEndpoint", {})
+                                        c_path = nav.get("canonicalBaseUrl", "") or f"/channel/{nav.get('browseId', '')}"
+                                        if c_path:
+                                            channel_url = f"https://www.youtube.com{c_path}" if c_path.startswith("/") else f"https://www.youtube.com/{c_path}"
+                                except Exception:
+                                    pass
+
+                                desc_snippet = ""
+                                try:
+                                    d_runs = v.get("detailedMetadataSnippets", [{}])[0].get("snippetText", {}).get("runs", [])
+                                    if not d_runs:
+                                        d_runs = v.get("descriptionSnippet", {}).get("runs", [])
+                                    if d_runs:
+                                        desc_snippet = "".join(r.get("text", "") for r in d_runs)
+                                except Exception:
+                                    pass
+
                                 if title and vid:
+                                    snippet_text = f"Video by {channel}{' (' + channel_badge + ')' if channel_badge else ''} • {view_count or 'Live'} • {published or 'Live now'}"
+                                    if desc_snippet:
+                                        snippet_text += f" — {desc_snippet[:180]}"
+
                                     videos.append({
                                         "position": pos,
                                         "title": title,
                                         "link": f"https://www.youtube.com/watch?v={vid}",
                                         "video_id": vid,
                                         "channel": channel,
+                                        "channel_url": channel_url,
+                                        "channel_badge": channel_badge,
                                         "views": view_count,
                                         "published": published,
                                         "duration": length or ("LIVE" if is_live else ""),
                                         "is_live": is_live,
+                                        "description": desc_snippet,
                                         "thumbnail": thumb_url,
-                                        "snippet": f"Video by {channel} &bull; {view_count or 'Live'} &bull; {published or 'Live now'}",
+                                        "snippet": snippet_text,
                                         "source": "YouTube"
                                     })
                                     pos += 1

@@ -19,6 +19,7 @@ from extended_engines import (
     PlacesEngine,
     MathAndUnitsEngine
 )
+from youtube_reader import YouTubeReader
 
 app = Flask(__name__, static_folder="static")
 
@@ -101,9 +102,9 @@ def serpapi_search():
     TOTAL_QUERIES += 1
     TOTAL_SERP_QUERIES += 1
 
-    query = request.args.get("q", "").strip()
+    query = request.args.get("q", "").strip() or request.args.get("v", "").strip() or request.args.get("video_id", "").strip() or request.args.get("url", "").strip()
     if not query:
-        return jsonify({"error": "Missing 'q' query parameter"}), 400
+        return jsonify({"error": "Missing 'q', 'v', or 'url' query parameter"}), 400
 
     engine = request.args.get("engine", "google").lower()
     tbs = request.args.get("tbs", "").lower()
@@ -157,6 +158,13 @@ def serpapi_search():
     if engine in ["youtube", "yt", "videos"]:
         live_only = request.args.get("live", "false").lower() == "true"
         return jsonify(YouTubeEngine.search_videos(query, limit=num, live_only=live_only))
+
+    # Route: YouTube Video Content & Transcript Reader
+    if engine in ["youtube_read", "yt_read", "read_video", "video_read"]:
+        v_id = request.args.get("v") or request.args.get("video_id") or query
+        lang = request.args.get("lang", "en")
+        force_stt = request.args.get("force_stt", "false").lower() == "true"
+        return jsonify(YouTubeReader.read_video(v_id, lang=lang, force_stt=force_stt))
 
     # Route: LinkedIn Public Guest Jobs Search Engine
     if engine in ["linkedin_jobs", "jobs", "linkedin"]:
@@ -521,6 +529,22 @@ def api_youtube_search():
     live_only = request.args.get("live", "false").lower() == "true"
     limit = int(request.args.get("limit", "10"))
     return jsonify(YouTubeEngine.search_videos(q, limit=limit, live_only=live_only))
+
+@app.route("/api/youtube/read", methods=["GET", "POST", "OPTIONS"])
+def api_youtube_read():
+    if request.method == "OPTIONS": return "", 204
+    active_keys = auth_manager.list_keys()
+    if len(active_keys) > 0 and not require_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    v_param = request.args.get("v") or request.args.get("video_id") or request.args.get("url") or data.get("v") or data.get("video_id") or data.get("url") or request.args.get("q", "")
+    if not v_param:
+        return jsonify({"error": "Missing 'v', 'video_id', or 'url' parameter"}), 400
+
+    lang = request.args.get("lang") or data.get("lang") or "en"
+    force_stt = (str(request.args.get("force_stt", "false")).lower() == "true") or bool(data.get("force_stt", False))
+    return jsonify(YouTubeReader.read_video(v_param, lang=lang, force_stt=force_stt))
 
 @app.route("/api/linkedin/jobs", methods=["GET", "POST", "OPTIONS"])
 def api_linkedin_jobs():
