@@ -89,7 +89,7 @@ class RedditEngine:
             "User-Agent": "NtaSearchBot/1.0 (by /u/ntamedia; Android sovereign node)",
             "Accept": "application/atom+xml, application/xml, text/xml"
         }
-        raw_bytes = make_request(rss_url, headers=reddit_headers, timeout=4.5)
+        raw_bytes = make_request(rss_url, headers=reddit_headers, timeout=2.0)
         if raw_bytes:
             try:
                 root = ET.fromstring(raw_bytes)
@@ -193,6 +193,34 @@ class RedditEngine:
                             })
                             if len(results) >= limit:
                                 break
+
+            # 3. High-Fidelity Chromium CDP Fallback if RSS and static scrapers are rate-limited
+            if len(results) < limit:
+                try:
+                    import cdp_driver
+                    if cdp_driver.chromium_driver.ensure_chromium_running():
+                        cdp_q = f"reddit r/{subreddit} {query}" if subreddit else f"reddit {query}"
+                        c_res = cdp_driver.chromium_driver.search_google(cdp_q, num=limit)
+                        for r in c_res.get("organic_results", []):
+                            r_link = r.get("link", "")
+                            if ("reddit.com" in r_link or "redditmedia.com" in r_link) and not any(x["link"] == r_link for x in results):
+                                sub_m = re.search(r"/r/([^/]+)/", r_link)
+                                sub_n = f"r/{sub_m.group(1)}" if sub_m else (f"r/{subreddit}" if subreddit else "r/reddit")
+                                clean_t = re.sub(r"\s*[-:|]\s*Reddit\s*$", "", r.get("title", ""), flags=re.I).strip()
+                                results.append({
+                                    "position": len(results) + 1,
+                                    "title": clean_t or r.get("title", ""),
+                                    "link": r_link,
+                                    "snippet": r.get("snippet", ""),
+                                    "subreddit": sub_n,
+                                    "author": "",
+                                    "date": r.get("date", ""),
+                                    "source": "Reddit"
+                                })
+                                if len(results) >= limit:
+                                    break
+                except Exception:
+                    pass
 
         elapsed = round(time.time() - start_t, 2)
         return {

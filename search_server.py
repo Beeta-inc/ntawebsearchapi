@@ -424,6 +424,7 @@ def scrape_endpoint():
 
 # ── 6. API Key Management (/createapi and /api/keys) ──
 @app.route("/createapi", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/keys/create", methods=["GET", "POST", "OPTIONS"])
 def create_api():
     if request.method == "OPTIONS":
         return "", 204
@@ -442,6 +443,7 @@ def create_api():
     }), 201
 
 @app.route("/api/keys", methods=["GET"])
+@app.route("/api/keys/list", methods=["GET"])
 def list_api_keys():
     # Only returns safe masked keys (prefix, suffix, usage count)
     return jsonify({
@@ -465,6 +467,7 @@ def delete_api_key():
     if not key_id:
         return jsonify({"error": "Missing key_id"}), 400
     success = auth_manager.delete_key(key_id)
+    return jsonify({"success": success}), (200 if success else 404)
 # ── 7. Sovereign Domain Endpoints (Reddit, GitHub, Amazon, YouTube, LinkedIn, Places, Calc) ──
 
 @app.route("/api/reddit/search", methods=["GET", "POST", "OPTIONS"])
