@@ -135,13 +135,35 @@
                 </thead>
                 <tbody>
                     <tr><td><code>q</code></td><td>String (Required)</td><td>-</td><td>Search query keywords</td></tr>
-                    <tr><td><code>engine</code></td><td>String</td><td><code>google</code></td><td><code>google</code> or <code>google_images</code></td></tr>
-                    <tr><td><code>tbs</code></td><td>String</td><td>-</td><td>Pass <code>itp:animated</code> to filter animated GIFs</td></tr>
+                    <tr><td><code>engine</code></td><td>String</td><td><code>google</code></td><td><code>google</code>, <code>google_images</code>, <code>reddit</code>, <code>github</code>, <code>youtube</code>, <code>linkedin_jobs</code>, <code>places</code>, <code>amazon_autocomplete</code></td></tr>
+                    <tr><td><code>tbs</code></td><td>String</td><td>-</td><td>Pass <code>itp:animated</code> to filter animated GIFs (for google_images)</td></tr>
+                    <tr><td><code>subreddit</code></td><td>String</td><td>-</td><td>Subreddit filter for <code>engine=reddit</code> (e.g. <code>reactjs</code>)</td></tr>
+                    <tr><td><code>location</code></td><td>String</td><td>-</td><td>Geographic location for <code>engine=linkedin_jobs</code></td></tr>
+                    <tr><td><code>country</code></td><td>String</td><td><code>us</code></td><td>Marketplace code for <code>engine=amazon_autocomplete</code> (<code>us</code>, <code>in</code>, <code>uk</code>, <code>de</code>, <code>ca</code>, <code>jp</code>)</td></tr>
                     <tr><td><code>num</code></td><td>Integer</td><td><code>10</code></td><td>Number of results to extract (1-30)</td></tr>
                     <tr><td><code>api_key</code></td><td>String</td><td>-</td><td>Your <code>nta_live_...</code> key</td></tr>
                 </tbody>
             </table>
         </div>
+        <p><strong>Example Specialized Engine Requests:</strong></p>
+        <pre># Reddit Discussions:
+curl -s "https://ntawebsearch.pages.dev/search?q=mechanical+keyboards&engine=reddit&subreddit=MechanicalKeyboards"
+
+# GitHub Repositories:
+curl -s "https://ntawebsearch.pages.dev/search?q=fastapi&engine=github&sort=stars"
+
+# YouTube Live Streams & Videos:
+curl -s "https://ntawebsearch.pages.dev/search?q=space+launch&engine=youtube&live=true"
+
+# LinkedIn Verified Jobs:
+curl -s "https://ntawebsearch.pages.dev/search?q=python+developer&engine=linkedin_jobs&location=Remote"
+
+# Places & OpenStreetMap Geocoding:
+curl -s "https://ntawebsearch.pages.dev/search?q=Eiffel+Tower&engine=places"
+
+# Instant Calculator & Unit Conversion:
+curl -s "https://ntawebsearch.pages.dev/search?q=sqrt(256)*4+20"
+curl -s "https://ntawebsearch.pages.dev/search?q=100+km+in+miles"</pre>
         <p><strong>Example Request:</strong></p>
         <pre>curl -s "https://ntawebsearch.pages.dev/search?q=RTX+5090+specs&engine=google&api_key=YOUR_KEY"</pre>
         <p><strong>Example Response:</strong></p>

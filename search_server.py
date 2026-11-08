@@ -10,6 +10,15 @@ from flask import Flask, request, jsonify, send_from_directory, render_template_
 from auth_manager import auth_manager
 from cdp_driver import chromium_driver
 from direct_scraper import direct_search_engine
+from extended_engines import (
+    RedditEngine,
+    GitHubEngine,
+    AmazonEngine,
+    YouTubeEngine,
+    LinkedInJobsEngine,
+    PlacesEngine,
+    MathAndUnitsEngine
+)
 
 app = Flask(__name__, static_folder="static")
 
@@ -109,17 +118,67 @@ def serpapi_search():
             "create_key_url": "https://ntawebsearch.pages.dev/createapi"
         }), 401
 
-    # Route 1: Google Images / Animated GIFs (Replacing _worker.js /api/gifs)
+    # Check Calculator / Unit Converter first
+    math_box = MathAndUnitsEngine.evaluate(query)
+    # If pure calculation or unit conversion without broader web keywords, return instantly
+    if math_box and (math_box.get("type") == "unit_converter" or not re.search(r"[a-zA-Z]{5,}", query)):
+        return jsonify({
+            "search_metadata": {
+                "status": "Success",
+                "engine": "sovereign_math_calculator",
+                "total_time_taken": 0.001,
+                "device": "Lenovo L38012 (Termux aarch64)"
+            },
+            "search_parameters": {"q": query, "engine": engine},
+            "answer_box": math_box,
+            "organic_results": [{
+                "position": 1,
+                "title": math_box.get("title", "Calculation Result"),
+                "answer": math_box.get("answer"),
+                "snippet": math_box.get("formula") or math_box.get("answer")
+            }]
+        })
+
+    # Route: Reddit Search Engine
+    if engine in ["reddit", "r"]:
+        sub = request.args.get("subreddit")
+        sort = request.args.get("sort", "relevance")
+        t_filter = request.args.get("time", "all")
+        return jsonify(RedditEngine.search(query, subreddit=sub, sort=sort, time_filter=t_filter, limit=num))
+
+    # Route: GitHub Repository Search Engine
+    if engine in ["github", "gh", "github_repos"]:
+        sort = request.args.get("sort", "stars")
+        return jsonify(GitHubEngine.search_repositories(query, limit=num, sort=sort))
+
+    # Route: YouTube Video & Live Stream Search Engine
+    if engine in ["youtube", "yt", "videos"]:
+        live_only = request.args.get("live", "false").lower() == "true"
+        return jsonify(YouTubeEngine.search_videos(query, limit=num, live_only=live_only))
+
+    # Route: LinkedIn Public Guest Jobs Search Engine
+    if engine in ["linkedin_jobs", "jobs", "linkedin"]:
+        location = request.args.get("location")
+        return jsonify(LinkedInJobsEngine.search_jobs(query, location=location, limit=num))
+
+    # Route: Maps & Local Places Geocoding Engine
+    if engine in ["places", "maps", "local"]:
+        return jsonify(PlacesEngine.search_places(query, limit=num))
+
+    # Route: Amazon Autocomplete / Product Suggestions
+    if engine in ["amazon_autocomplete", "amazon"]:
+        country = request.args.get("country", "us")
+        return jsonify(AmazonEngine.autocomplete(query, country=country))
+
+    # Route: Google Images / Animated GIFs
     if engine in ["google_images", "images"]:
         is_animated = "itp:animated" in tbs or "gif" in tbs
         try:
-            # Try Real Chromium Sandbox
             if chromium_driver.is_alive():
                 return jsonify(chromium_driver.search_google_images(query, num=num, animated_only=is_animated))
         except Exception as e:
             print(f"[SEARCH] Chromium image search failed ({e}), using fallback.", flush=True)
 
-        # Fallback to direct Bing/Google image scraper
         fallback_images = []
         try:
             encoded = urllib.parse.quote_plus(query)
@@ -146,19 +205,27 @@ def serpapi_search():
             "images_results": fallback_images
         })
 
-    # Route 2: Standard Google Organic Web Search
+    # Route: Standard Organic Web Search (Google / Multi-Engine)
     # 1. Try Real Headless Chromium Sandbox
+    result = None
     if chromium_driver.ensure_chromium_running():
         try:
             result = chromium_driver.search_google(query, num=num, engine=engine)
-            if result.get("organic_results"):
-                return jsonify(result)
+            if not result.get("organic_results"):
+                result = None
         except Exception as e:
             print(f"[SEARCH] Chromium search error ({e}), seamlessly falling back to multi-engine.", flush=True)
+            result = None
 
     # 2. Seamless Fast Multi-Engine Fallback
-    fallback_res = direct_search_engine.execute_multi_search(query, num=num)
-    return jsonify(fallback_res)
+    if not result:
+        result = direct_search_engine.execute_multi_search(query, num=num)
+
+    # Attach calculator answer box if detected on web query
+    if math_box and not result.get("answer_box"):
+        result["answer_box"] = math_box
+
+    return jsonify(result)
 
 # ── 4. Modern AI Search Endpoint (/api/search) ──
 @app.route("/api/search", methods=["GET", "POST", "OPTIONS"])
@@ -190,28 +257,96 @@ def ai_search():
     results = []
     engine_used = "multi_engine"
 
+    # 1. Calculator / Math check
+    math_box = MathAndUnitsEngine.evaluate(query)
+
+    # 2. Domain intent routing for AI search
+    q_lower = query.lower()
+    extra_observation_sections = []
+
+    # If user explicitly asks for Reddit
+    if "reddit" in q_lower:
+        try:
+            reddit_data = RedditEngine.search(query, limit=5)
+            r_posts = reddit_data.get("reddit_results", [])
+            if r_posts:
+                r_lines = ["\n=== REDDIT COMMUNITY DISCUSSIONS & USER THREADS ==="]
+                for p in r_posts:
+                    r_lines.append(f"• [{p.get('subreddit', 'r/reddit')}] {p['title']}")
+                    r_lines.append(f"  URL: {p['link']}")
+                    if p.get("snippet"):
+                        r_lines.append(f"  Extract: {p['snippet']}")
+                extra_observation_sections.append("\n".join(r_lines))
+        except Exception:
+            pass
+
+    # If user explicitly asks for GitHub
+    if "github" in q_lower:
+        try:
+            gh_data = GitHubEngine.search_repositories(query, limit=4)
+            gh_repos = gh_data.get("github_results", [])
+            if gh_repos:
+                gh_lines = ["\n=== GITHUB OPEN-SOURCE REPOSITORIES ==="]
+                for g in gh_repos:
+                    gh_lines.append(f"• {g['title']} [⭐ {g['stars']} stars, {g['language'] or 'Tech'}]")
+                    gh_lines.append(f"  URL: {g['link']}")
+                    if g.get("description"):
+                        gh_lines.append(f"  Description: {g['description']}")
+                extra_observation_sections.append("\n".join(gh_lines))
+        except Exception:
+            pass
+
+    # If user explicitly asks for Jobs
+    if re.search(r"\b(?:jobs?|hiring|careers?)\b", q_lower):
+        try:
+            job_data = LinkedInJobsEngine.search_jobs(query, limit=4)
+            j_list = job_data.get("jobs_results", [])
+            if j_list:
+                j_lines = ["\n=== VERIFIED CAREER OPPORTUNITIES & JOB OPENINGS ==="]
+                for j in j_list:
+                    j_lines.append(f"• {j['title']} at {j['company']} ({j['location']})")
+                    j_lines.append(f"  Application Link: {j['link']}")
+                extra_observation_sections.append("\n".join(j_lines))
+        except Exception:
+            pass
+
     # Attempt Real Chromium Sandbox first
+    res = None
     if chromium_driver.ensure_chromium_running():
         try:
             res = chromium_driver.search_google(query, num=num)
             results = res.get("organic_results", [])
-            engine_used = "real_chromium_sandbox"
+            if results:
+                engine_used = "real_chromium_sandbox"
+            else:
+                res = None
         except Exception:
-            pass
+            res = None
 
     # Seamless Fallback if empty
-    if not results:
+    if not results or not res:
         res = direct_search_engine.execute_multi_search(query, num=num)
         results = res.get("organic_results", [])
         engine_used = "multi_engine_tls_fallback"
 
-    observation_text = (res or {}).get("observation") or direct_search_engine.build_ai_observation(
+    base_obs = (res or {}).get("observation") or direct_search_engine.build_ai_observation(
         organic_results=results,
-        answer_box=(res or {}).get("answer_box"),
+        answer_box=(res or {}).get("answer_box") or math_box,
         knowledge_graph=(res or {}).get("knowledge_graph"),
         top_stories=(res or {}).get("top_stories"),
         query=query
     )
+
+    # Prepend math answer if available
+    obs_parts = []
+    if math_box:
+        obs_parts.append(f"=== DIRECT CALCULATOR / UNIT CONVERSION ANSWER ===\nResult: {math_box.get('answer')}\nFormula: {math_box.get('formula') or math_box.get('latex') or ''}\n")
+    obs_parts.append(base_obs)
+    if extra_observation_sections:
+        obs_parts.extend(extra_observation_sections)
+
+    final_observation = "\n".join(obs_parts)
+
     images = []
     if include_images:
         try:
@@ -226,9 +361,10 @@ def ai_search():
         "query": query,
         "elapsed_ms": elapsed_ms,
         "engine": engine_used,
+        "answer_box": math_box or (res or {}).get("answer_box"),
         "results": results,
         "images": images,
-        "observation": observation_text
+        "observation": final_observation
     })
 
 # ── 5. Deep Web Page Scraper (/api/scrape) ──
@@ -319,7 +455,98 @@ def delete_api_key():
     if not key_id:
         return jsonify({"error": "Missing key_id"}), 400
     success = auth_manager.delete_key(key_id)
-    return jsonify({"success": success}), (200 if success else 404)
+# ── 7. Sovereign Domain Endpoints (Reddit, GitHub, Amazon, YouTube, LinkedIn, Places, Calc) ──
+
+@app.route("/api/reddit/search", methods=["GET", "POST", "OPTIONS"])
+def api_reddit_search():
+    if request.method == "OPTIONS": return "", 204
+    active_keys = auth_manager.list_keys()
+    if len(active_keys) > 0 and not require_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    q = request.args.get("q") or (request.get_json(silent=True) or {}).get("q", "")
+    if not q: return jsonify({"error": "Missing 'q' query parameter"}), 400
+    sub = request.args.get("subreddit")
+    sort = request.args.get("sort", "relevance")
+    t_filter = request.args.get("time", "all")
+    limit = int(request.args.get("limit", "10"))
+    return jsonify(RedditEngine.search(q, subreddit=sub, sort=sort, time_filter=t_filter, limit=limit))
+
+@app.route("/api/github/profile", methods=["GET", "OPTIONS"])
+def api_github_profile():
+    if request.method == "OPTIONS": return "", 204
+    user = request.args.get("user") or request.args.get("username", "")
+    if not user: return jsonify({"error": "Missing 'user' query parameter"}), 400
+    res = GitHubEngine.get_profile(user)
+    return jsonify(res), (res.get("status", 200) if isinstance(res.get("status"), int) else 200)
+
+@app.route("/api/github/repo", methods=["GET", "OPTIONS"])
+def api_github_repo():
+    if request.method == "OPTIONS": return "", 204
+    repo_param = request.args.get("repo", "")
+    owner = request.args.get("owner", "")
+    if "/" in repo_param:
+        parts = repo_param.strip().split("/", 1)
+        owner, repo_name = parts[0], parts[1]
+    else:
+        repo_name = repo_param
+
+    if not owner or not repo_name:
+        return jsonify({"error": "Missing 'owner' and 'repo' parameter (e.g. repo=torvalds/linux)"}), 400
+    res = GitHubEngine.get_repository(owner, repo_name)
+    return jsonify(res), (res.get("status", 200) if isinstance(res.get("status"), int) else 200)
+
+@app.route("/api/github/trending", methods=["GET", "OPTIONS"])
+def api_github_trending():
+    if request.method == "OPTIONS": return "", 204
+    lang = request.args.get("language")
+    since = request.args.get("since", "daily")
+    return jsonify(GitHubEngine.get_trending(language=lang, since=since))
+
+@app.route("/api/amazon/autocomplete", methods=["GET", "OPTIONS"])
+def api_amazon_autocomplete():
+    if request.method == "OPTIONS": return "", 204
+    q = request.args.get("q") or request.args.get("prefix", "")
+    if not q: return jsonify({"error": "Missing 'q' query parameter"}), 400
+    country = request.args.get("country", "us")
+    return jsonify(AmazonEngine.autocomplete(q, country=country))
+
+@app.route("/api/youtube/search", methods=["GET", "POST", "OPTIONS"])
+def api_youtube_search():
+    if request.method == "OPTIONS": return "", 204
+    q = request.args.get("q") or (request.get_json(silent=True) or {}).get("q", "")
+    if not q: return jsonify({"error": "Missing 'q' query parameter"}), 400
+    live_only = request.args.get("live", "false").lower() == "true"
+    limit = int(request.args.get("limit", "10"))
+    return jsonify(YouTubeEngine.search_videos(q, limit=limit, live_only=live_only))
+
+@app.route("/api/linkedin/jobs", methods=["GET", "POST", "OPTIONS"])
+def api_linkedin_jobs():
+    if request.method == "OPTIONS": return "", 204
+    keywords = request.args.get("keywords") or request.args.get("q") or (request.get_json(silent=True) or {}).get("keywords", "")
+    if not keywords: return jsonify({"error": "Missing 'keywords' parameter"}), 400
+    location = request.args.get("location")
+    limit = int(request.args.get("limit", "10"))
+    return jsonify(LinkedInJobsEngine.search_jobs(keywords, location=location, limit=limit))
+
+@app.route("/api/places/search", methods=["GET", "OPTIONS"])
+def api_places_search():
+    if request.method == "OPTIONS": return "", 204
+    q = request.args.get("q") or request.args.get("place", "")
+    if not q: return jsonify({"error": "Missing 'q' query parameter"}), 400
+    limit = int(request.args.get("limit", "10"))
+    return jsonify(PlacesEngine.search_places(q, limit=limit))
+
+@app.route("/api/calc", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/math", methods=["GET", "POST", "OPTIONS"])
+def api_calc():
+    if request.method == "OPTIONS": return "", 204
+    expr = request.args.get("q") or request.args.get("expr") or (request.get_json(silent=True) or {}).get("expr", "")
+    if not expr: return jsonify({"error": "Missing 'q' or 'expr' parameter"}), 400
+    res = MathAndUnitsEngine.evaluate(expr)
+    if res:
+        return jsonify({"success": True, "answer_box": res})
+    return jsonify({"success": False, "error": f"Could not evaluate expression or conversion '{expr}'"}), 400
 
 if __name__ == "__main__":
     print("[NTA-WEBSEARCH] 🚀 Starting Sovereign Search Server on port 3001...", flush=True)
