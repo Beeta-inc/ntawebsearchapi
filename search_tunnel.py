@@ -130,7 +130,7 @@ def read_cloudflared_output(process):
         print(line, end='', flush=True)
         if current_url is None:
             match = re.search(r'(https://[a-zA-Z0-9-]+\.trycloudflare\.com)', line)
-            if match:
+            if match and "api.trycloudflare.com" not in match.group(1):
                 current_url = match.group(1)
                 print(f"\n[+] LIVE SEARCH TUNNEL: {current_url}\n", flush=True)
                 threading.Thread(target=register_with_pages, args=(current_url,), daemon=True).start()
