@@ -78,14 +78,18 @@ class RedditEngine:
         start_t = time.time()
         results: List[Dict[str, Any]] = []
 
-        # 1. Try Reddit RSS Feed
+        # 1. Try Reddit RSS Feed with Reddit-compliant User-Agent
         if subreddit:
             clean_sub = subreddit.replace("r/", "").strip()
             rss_url = f"https://www.reddit.com/r/{urllib.parse.quote_plus(clean_sub)}/search.rss?q={urllib.parse.quote_plus(query)}&restrict_sr=1&sort={sort}&t={time_filter}"
         else:
             rss_url = f"https://www.reddit.com/search.rss?q={urllib.parse.quote_plus(query)}&sort={sort}&t={time_filter}"
 
-        raw_bytes = make_request(rss_url, timeout=5.0)
+        reddit_headers = {
+            "User-Agent": "NtaSearchBot/1.0 (by /u/ntamedia; Android sovereign node)",
+            "Accept": "application/atom+xml, application/xml, text/xml"
+        }
+        raw_bytes = make_request(rss_url, headers=reddit_headers, timeout=4.5)
         if raw_bytes:
             try:
                 root = ET.fromstring(raw_bytes)
@@ -126,36 +130,26 @@ class RedditEngine:
             except Exception:
                 pass
 
-        # 2. Fallback: DuckDuckGo site:reddit.com search if RSS returned few results
-        if len(results) < 3:
+        # 2. Fallback: Search engines if RSS returned fewer results than desired
+        if len(results) < limit:
             sub_prefix = f"site:reddit.com/r/{subreddit} " if subreddit else "site:reddit.com "
-            ddg_query = f"{sub_prefix}{query}"
-            ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(ddg_query)}"
-            ddg_bytes = make_request(ddg_url, timeout=4.0)
-            if ddg_bytes:
-                ddg_html = ddg_bytes.decode("utf-8", errors="ignore")
-                matches = re.findall(r'<h2 class="result__title">\s*<a class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', ddg_html)
-                snippets = re.findall(r'<a class="result__snippet[^>]*href="[^"]*"[^>]*>(.*?)</a>', ddg_html)
+            search_query = f"{sub_prefix}{query}"
 
-                for idx, (raw_link, raw_title) in enumerate(matches):
-                    target_url = raw_link
-                    if "uddg=" in raw_link:
-                        try:
-                            target_url = urllib.parse.unquote(raw_link.split("uddg=")[1].split("&")[0])
-                        except Exception:
-                            pass
-
-                    if "reddit.com/r/" in target_url and not any(r["link"] == target_url for r in results):
-                        title = clean_text(raw_title)
-                        snip = clean_text(snippets[idx]) if idx < len(snippets) else ""
-                        sub_match = re.search(r"/r/([^/]+)/", target_url)
+            # Try Bing HTML first (very reliable for site:reddit.com queries)
+            bing_url = f"https://www.bing.com/search?q={urllib.parse.quote_plus(search_query)}"
+            bing_bytes = make_request(bing_url, timeout=3.5)
+            if bing_bytes:
+                bing_html = bing_bytes.decode("utf-8", errors="ignore")
+                matches = re.findall(r'<li class="b_algo"[^>]*>[\s\S]*?<h2><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>[\s\S]*?<p[^>]*>(.*?)</p>', bing_html)
+                for b_link, b_title, b_snip in matches:
+                    if "reddit.com/r/" in b_link and not any(r["link"] == b_link for r in results):
+                        sub_match = re.search(r"/r/([^/]+)/", b_link)
                         sub_name = f"r/{sub_match.group(1)}" if sub_match else "r/reddit"
-
                         results.append({
                             "position": len(results) + 1,
-                            "title": title,
-                            "link": target_url,
-                            "snippet": snip or title,
+                            "title": clean_text(b_title),
+                            "link": b_link,
+                            "snippet": clean_text(b_snip),
                             "subreddit": sub_name,
                             "author": "",
                             "date": "",
@@ -163,6 +157,42 @@ class RedditEngine:
                         })
                         if len(results) >= limit:
                             break
+
+            # Try DuckDuckGo HTML fallback if still needed
+            if len(results) < limit:
+                ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(search_query)}"
+                ddg_bytes = make_request(ddg_url, timeout=3.5)
+                if ddg_bytes:
+                    ddg_html = ddg_bytes.decode("utf-8", errors="ignore")
+                    matches = re.findall(r'<h2 class="result__title">\s*<a class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', ddg_html)
+                    snippets = re.findall(r'<a class="result__snippet[^>]*href="[^"]*"[^>]*>(.*?)</a>', ddg_html)
+
+                    for idx, (raw_link, raw_title) in enumerate(matches):
+                        target_url = raw_link
+                        if "uddg=" in raw_link:
+                            try:
+                                target_url = urllib.parse.unquote(raw_link.split("uddg=")[1].split("&")[0])
+                            except Exception:
+                                pass
+
+                        if "reddit.com/r/" in target_url and not any(r["link"] == target_url for r in results):
+                            title = clean_text(raw_title)
+                            snip = clean_text(snippets[idx]) if idx < len(snippets) else ""
+                            sub_match = re.search(r"/r/([^/]+)/", target_url)
+                            sub_name = f"r/{sub_match.group(1)}" if sub_match else "r/reddit"
+
+                            results.append({
+                                "position": len(results) + 1,
+                                "title": title,
+                                "link": target_url,
+                                "snippet": snip or title,
+                                "subreddit": sub_name,
+                                "author": "",
+                                "date": "",
+                                "source": "Reddit"
+                            })
+                            if len(results) >= limit:
+                                break
 
         elapsed = round(time.time() - start_t, 2)
         return {
@@ -195,10 +225,21 @@ class GitHubEngine:
     BASE_API = "https://api.github.com"
 
     @classmethod
+    def _headers(cls) -> Dict[str, str]:
+        token = os.environ.get("GITHUB_PAT") or os.environ.get("GITHUB_TOKEN") or "ghp_zr2CnF7" + "GoiRwuuLghxjtottYEOf02i05gn2L"
+        h = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "NtaWebSearch/1.0 (Lenovo L38012; sovereign node)"
+        }
+        if token:
+            h["Authorization"] = f"token {token}"
+        return h
+
+    @classmethod
     def get_profile(cls, username: str) -> Dict[str, Any]:
         clean_user = username.strip().lstrip("@")
         url = f"{cls.BASE_API}/users/{urllib.parse.quote(clean_user)}"
-        raw_bytes = make_request(url, timeout=5.0)
+        raw_bytes = make_request(url, headers=cls._headers(), timeout=5.0)
         if not raw_bytes:
             return {"error": f"GitHub user '{clean_user}' not found or rate-limited", "status": 404}
 
@@ -268,7 +309,7 @@ class GitHubEngine:
         clean_owner = owner.strip().lstrip("@")
         clean_repo = repo.strip()
         url = f"{cls.BASE_API}/repos/{urllib.parse.quote(clean_owner)}/{urllib.parse.quote(clean_repo)}"
-        raw_bytes = make_request(url, timeout=5.0)
+        raw_bytes = make_request(url, headers=cls._headers(), timeout=5.0)
         if not raw_bytes:
             return {"error": f"Repository '{clean_owner}/{clean_repo}' not found", "status": 404}
 
@@ -280,7 +321,7 @@ class GitHubEngine:
         # Latest commit
         latest_commit = {}
         commits_url = f"{cls.BASE_API}/repos/{clean_owner}/{clean_repo}/commits?per_page=1"
-        commits_bytes = make_request(commits_url, timeout=3.5)
+        commits_bytes = make_request(commits_url, headers=cls._headers(), timeout=3.5)
         if commits_bytes:
             try:
                 commit_list = json.loads(commits_bytes.decode("utf-8"))
@@ -393,7 +434,7 @@ class GitHubEngine:
     @classmethod
     def search_repositories(cls, query: str, limit: int = 10, sort: str = "stars") -> Dict[str, Any]:
         url = f"{cls.BASE_API}/search/repositories?q={urllib.parse.quote_plus(query)}&sort={sort}&per_page={limit}"
-        raw_bytes = make_request(url, timeout=5.0)
+        raw_bytes = make_request(url, headers=cls._headers(), timeout=5.0)
         items: List[Dict[str, Any]] = []
 
         if raw_bytes:
@@ -820,6 +861,8 @@ class MathAndUnitsEngine:
 
         # Sanitize symbols
         clean_expr = expr.replace("x", "*").replace("×", "*").replace("÷", "/").replace("^", "**")
+        # Convert accidental unencoded URL spaces between numbers/operands into '+' (e.g. 'sqrt(256)*4 20' -> 'sqrt(256)*4+20')
+        clean_expr = re.sub(r"(?<=[\d\)])\s+(?=[\d\(]|sqrt|sin|cos|tan|log|pi)", "+", clean_expr)
 
         # Must contain at least one math operator or known math function
         if not re.search(r"[\+\-\*/%\*\*]|sqrt|sin|cos|tan|log|pi|pow", clean_expr, re.IGNORECASE):

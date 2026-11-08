@@ -43,7 +43,9 @@ def extract_api_key():
 
 def require_auth():
     """Validates API key for protected search and scrape endpoints."""
-    # Allow local requests or requests with valid sovereign key
+    # Allow loopback and local internal cluster mesh requests without API key
+    if request.remote_addr in ["127.0.0.1", "::1", "localhost"] and not request.headers.get("cf-connecting-ip"):
+        return True
     key = extract_api_key()
     if not key:
         return False
