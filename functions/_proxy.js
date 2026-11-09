@@ -102,8 +102,10 @@ export async function handleRequest(context) {
   let response = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      const isHeavyJob = url.pathname.includes('/api/youtube') || url.pathname.includes('/search') || url.pathname.includes('/api/scrape');
+      const timeoutMs = isHeavyJob ? 95000 : 45000;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000);
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       const proxyHeaders = new Headers(request.headers);
       proxyHeaders.delete("cf-connecting-ip");

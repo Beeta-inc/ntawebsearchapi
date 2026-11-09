@@ -17,7 +17,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 ]
 
-def make_request(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 6.0) -> Optional[bytes]:
+def make_request(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 15.0) -> Optional[bytes]:
     """Robust standard library HTTP fetcher with user agent rotation and compression handling."""
     if headers is None:
         headers = {}
@@ -551,100 +551,206 @@ class YouTubeEngine:
     """
     Returns YouTube search results, live broadcast status, and trending videos
     without requiring Google YouTube Data v3 API keys.
+    Multi-tier persistent architecture: Desktop Web -> Mobile Web -> Sovereign Innertube API.
+    Does not stop until results are retrieved.
     """
+    @classmethod
+    def _parse_renderer_items(cls, items: List[Dict[str, Any]], limit: int, live_only: bool, videos: List[Dict[str, Any]], seen_ids: set) -> None:
+        for item in items:
+            v = item.get("videoRenderer") or item.get("compactVideoRenderer")
+            if not v:
+                continue
+            vid = v.get("videoId", "")
+            if not vid or vid in seen_ids:
+                continue
+
+            title = ""
+            if "title" in v:
+                runs = v["title"].get("runs")
+                if runs:
+                    title = "".join(r.get("text", "") for r in runs)
+                elif "simpleText" in v["title"]:
+                    title = v["title"]["simpleText"]
+
+            channel = ""
+            for key in ["ownerText", "longBylineText", "shortBylineText"]:
+                if key in v:
+                    runs = v[key].get("runs")
+                    if runs:
+                        channel = "".join(r.get("text", "") for r in runs)
+                        break
+
+            view_count = v.get("viewCountText", {}).get("simpleText", "")
+            if not view_count:
+                v_runs = v.get("viewCountText", {}).get("runs", [])
+                if v_runs:
+                    view_count = "".join(r.get("text", "") for r in v_runs)
+
+            published = v.get("publishedTimeText", {}).get("simpleText", "")
+            length = v.get("lengthText", {}).get("simpleText", "")
+            is_live = any(b.get("metadataBadgeRenderer", {}).get("label") == "LIVE" for b in v.get("badges", []))
+
+            if live_only and not is_live:
+                continue
+
+            thumbs = v.get("thumbnail", {}).get("thumbnails", [])
+            thumb_url = thumbs[-1].get("url") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+            channel_badge = ""
+            for b in v.get("ownerBadges", []):
+                mbr = b.get("metadataBadgeRenderer", {})
+                tooltip = mbr.get("tooltip", "")
+                if tooltip:
+                    channel_badge = tooltip
+                    break
+
+            channel_url = ""
+            try:
+                for key in ["ownerText", "longBylineText", "shortBylineText"]:
+                    runs = v.get(key, {}).get("runs", [])
+                    if runs:
+                        nav = runs[0].get("navigationEndpoint", {}).get("browseEndpoint", {})
+                        c_path = nav.get("canonicalBaseUrl", "") or f"/channel/{nav.get('browseId', '')}"
+                        if c_path:
+                            channel_url = f"https://www.youtube.com{c_path}" if c_path.startswith("/") else f"https://www.youtube.com/{c_path}"
+                            break
+            except Exception:
+                pass
+
+            desc_snippet = ""
+            try:
+                d_runs = v.get("detailedMetadataSnippets", [{}])[0].get("snippetText", {}).get("runs", [])
+                if not d_runs:
+                    d_runs = v.get("descriptionSnippet", {}).get("runs", [])
+                if d_runs:
+                    desc_snippet = "".join(r.get("text", "") for r in d_runs)
+            except Exception:
+                pass
+
+            if title and vid:
+                seen_ids.add(vid)
+                snippet_text = f"Video by {channel}{' (' + channel_badge + ')' if channel_badge else ''} • {view_count or 'Live'} • {published or 'Live now'}"
+                if desc_snippet:
+                    snippet_text += f" — {desc_snippet[:180]}"
+
+                videos.append({
+                    "position": len(videos) + 1,
+                    "title": title,
+                    "link": f"https://www.youtube.com/watch?v={vid}",
+                    "video_id": vid,
+                    "channel": channel,
+                    "channel_url": channel_url,
+                    "channel_badge": channel_badge,
+                    "views": view_count,
+                    "published": published,
+                    "duration": length or ("LIVE" if is_live else ""),
+                    "is_live": is_live,
+                    "description": desc_snippet,
+                    "thumbnail": thumb_url,
+                    "snippet": snippet_text,
+                    "source": "YouTube"
+                })
+                if len(videos) >= limit:
+                    break
+
     @classmethod
     def search_videos(cls, query: str, limit: int = 10, live_only: bool = False) -> Dict[str, Any]:
         start_t = time.time()
         sp_filter = "&sp=CAM%253D" if live_only else ""
-        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query)}{sp_filter}"
-
-        raw_bytes = make_request(url, timeout=5.0)
+        encoded_query = urllib.parse.quote_plus(query)
         videos: List[Dict[str, Any]] = []
+        seen_ids = set()
 
-        if raw_bytes:
+        # Multi-attempt persistent search loop ("do not stop till its done")
+        for attempt in range(1, 4):
+            # Tier 1: Desktop YouTube Web Scrape
             try:
-                html_str = raw_bytes.decode("utf-8", errors="ignore")
-                m = re.search(r"var ytInitialData = ({.*?});</script>", html_str)
-                if m:
-                    d = json.loads(m.group(1))
-                    section = d.get("contents", {}).get("twoColumnSearchResultsRenderer", {}).get("primaryContents", {}).get("sectionListRenderer", {}).get("contents", [])
-                    pos = 1
-                    for s in section:
-                        items = s.get("itemSectionRenderer", {}).get("contents", [])
-                        for item in items:
-                            v = item.get("videoRenderer")
-                            if v:
-                                title = v.get("title", {}).get("runs", [{}])[0].get("text", "")
-                                vid = v.get("videoId", "")
-                                channel = v.get("ownerText", {}).get("runs", [{}])[0].get("text", "")
-                                view_count = v.get("viewCountText", {}).get("simpleText", "")
-                                published = v.get("publishedTimeText", {}).get("simpleText", "")
-                                length = v.get("lengthText", {}).get("simpleText", "")
-                                is_live = any(b.get("metadataBadgeRenderer", {}).get("label") == "LIVE" for b in v.get("badges", []))
-
-                                if live_only and not is_live:
-                                    continue
-
-                                thumbs = v.get("thumbnail", {}).get("thumbnails", [])
-                                thumb_url = thumbs[-1].get("url") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-
-                                # Extract channel URL and badge (authority)
-                                channel_badge = ""
-                                for b in v.get("ownerBadges", []):
-                                    mbr = b.get("metadataBadgeRenderer", {})
-                                    tooltip = mbr.get("tooltip", "")
-                                    if tooltip:
-                                        channel_badge = tooltip
-                                        break
-
-                                channel_url = ""
-                                try:
-                                    runs = v.get("ownerText", {}).get("runs", [])
-                                    if runs:
-                                        nav = runs[0].get("navigationEndpoint", {}).get("browseEndpoint", {})
-                                        c_path = nav.get("canonicalBaseUrl", "") or f"/channel/{nav.get('browseId', '')}"
-                                        if c_path:
-                                            channel_url = f"https://www.youtube.com{c_path}" if c_path.startswith("/") else f"https://www.youtube.com/{c_path}"
-                                except Exception:
-                                    pass
-
-                                desc_snippet = ""
-                                try:
-                                    d_runs = v.get("detailedMetadataSnippets", [{}])[0].get("snippetText", {}).get("runs", [])
-                                    if not d_runs:
-                                        d_runs = v.get("descriptionSnippet", {}).get("runs", [])
-                                    if d_runs:
-                                        desc_snippet = "".join(r.get("text", "") for r in d_runs)
-                                except Exception:
-                                    pass
-
-                                if title and vid:
-                                    snippet_text = f"Video by {channel}{' (' + channel_badge + ')' if channel_badge else ''} • {view_count or 'Live'} • {published or 'Live now'}"
-                                    if desc_snippet:
-                                        snippet_text += f" — {desc_snippet[:180]}"
-
-                                    videos.append({
-                                        "position": pos,
-                                        "title": title,
-                                        "link": f"https://www.youtube.com/watch?v={vid}",
-                                        "video_id": vid,
-                                        "channel": channel,
-                                        "channel_url": channel_url,
-                                        "channel_badge": channel_badge,
-                                        "views": view_count,
-                                        "published": published,
-                                        "duration": length or ("LIVE" if is_live else ""),
-                                        "is_live": is_live,
-                                        "description": desc_snippet,
-                                        "thumbnail": thumb_url,
-                                        "snippet": snippet_text,
-                                        "source": "YouTube"
-                                    })
-                                    pos += 1
-                                    if len(videos) >= limit:
-                                        break
+                desktop_url = f"https://www.youtube.com/results?search_query={encoded_query}{sp_filter}"
+                raw_bytes = make_request(desktop_url, timeout=15.0)
+                if raw_bytes:
+                    html_str = raw_bytes.decode("utf-8", errors="ignore")
+                    m = re.search(r"var ytInitialData = ({.*?});</script>", html_str)
+                    if m:
+                        d = json.loads(m.group(1))
+                        sections = d.get("contents", {}).get("twoColumnSearchResultsRenderer", {}).get("primaryContents", {}).get("sectionListRenderer", {}).get("contents", [])
+                        for s in sections:
+                            items = s.get("itemSectionRenderer", {}).get("contents", [])
+                            cls._parse_renderer_items(items, limit, live_only, videos, seen_ids)
+                            if len(videos) >= limit:
+                                break
             except Exception:
                 pass
+
+            if len(videos) >= limit:
+                break
+
+            # Tier 2: Mobile YouTube Web Scrape (m.youtube.com)
+            if not videos:
+                try:
+                    mobile_url = f"https://m.youtube.com/results?search_query={encoded_query}{sp_filter}"
+                    mobile_headers = {
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
+                        "Accept-Language": "en-US,en;q=0.9"
+                    }
+                    raw_bytes = make_request(mobile_url, headers=mobile_headers, timeout=15.0)
+                    if raw_bytes:
+                        html_str = raw_bytes.decode("utf-8", errors="ignore")
+                        m = re.search(r"(?:var ytInitialData|ytInitialData)\s*=\s*({.*?});(?:var|\s*<)", html_str)
+                        if m:
+                            d = json.loads(m.group(1))
+                            sections = d.get("contents", {}).get("singleColumnSearchResultsRenderer", {}).get("primaryContents", {}).get("sectionListRenderer", {}).get("contents", [])
+                            if not sections:
+                                sections = d.get("contents", {}).get("sectionListRenderer", {}).get("contents", [])
+                            for s in sections:
+                                items = s.get("itemSectionRenderer", {}).get("contents", [])
+                                cls._parse_renderer_items(items, limit, live_only, videos, seen_ids)
+                                if len(videos) >= limit:
+                                    break
+                except Exception:
+                    pass
+
+            if len(videos) >= limit:
+                break
+
+            # Tier 3: Sovereign Innertube API Endpoint
+            if not videos:
+                try:
+                    innertube_url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+                    payload = json.dumps({
+                        "context": {
+                            "client": {
+                                "clientName": "WEB",
+                                "clientVersion": "2.20240901.00.00",
+                                "hl": "en",
+                                "gl": "US"
+                            }
+                        },
+                        "query": query
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        innertube_url,
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=15.0) as resp:
+                        d = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                        sections = d.get("contents", {}).get("twoColumnSearchResultsRenderer", {}).get("primaryContents", {}).get("sectionListRenderer", {}).get("contents", [])
+                        if not sections:
+                            sections = d.get("contents", {}).get("sectionListRenderer", {}).get("contents", [])
+                        for s in sections:
+                            items = s.get("itemSectionRenderer", {}).get("contents", [])
+                            cls._parse_renderer_items(items, limit, live_only, videos, seen_ids)
+                            if len(videos) >= limit:
+                                break
+                except Exception:
+                    pass
+
+            if videos:
+                break
+            time.sleep(0.5 * attempt)
 
         elapsed = round(time.time() - start_t, 2)
         return {

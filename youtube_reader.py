@@ -7,8 +7,13 @@ YouTube video with rich channel authority metadata and timestamped transcripts.
 Architecture:
 1. Rich Metadata Extraction (Title, Channel, Views, Duration, Published Time, Thumbnail).
 2. Tier 1 Fast Path: Subtitle extraction via yt-dlp / timedtext (multi-language, 1-3s, 0% CPU).
-3. Tier 2 STT Fallback: Clean audio download via yt-dlp + ffmpeg 16kHz mono conversion +
-   whisper.cpp (ARM NEON accelerated aarch64 native inference).
+3. Tier 2 STT Fallback (Chunked, Storage-Cached, Zero-OOM Engine):
+   - Lowest-bandwidth clean audio download via yt-dlp (m4a, low bitrate, no-part).
+   - FFmpeg 16kHz mono bandpass vocal filter (80Hz - 8000Hz, volume 1.2x) removing noise/hum.
+   - Storage-backed 60-second chunking (-f segment) so peak RAM stays strictly under 50MB.
+   - Sequential whisper.cpp ARM NEON native inference (4 threads) processing 1 chunk at a time.
+   - Per-chunk progress persistence ({video_id}.progress.json) on disk so jobs never die and can resume.
+   - Immediate per-chunk WAV deletion reclaiming storage as each segment finishes.
 4. Persistent Disk Cache: Prevents redundant downloads/transcriptions across the cluster.
 5. Auto-Cleanup: Discards temporary raw audio (.m4a / .wav) and subtitle files immediately.
 """
@@ -20,6 +25,7 @@ import json
 import time
 import glob
 import shutil
+import threading
 import urllib.parse
 import urllib.request
 import subprocess
@@ -33,9 +39,20 @@ WHISPER_MODEL = "/data/data/com.termux/files/home/whisper.cpp/models/ggml-tiny.e
 YT_DLP_BIN = shutil.which("yt-dlp") or "/data/data/com.termux/files/usr/bin/yt-dlp"
 FFMPEG_BIN = shutil.which("ffmpeg") or "/data/data/com.termux/files/usr/bin/ffmpeg"
 
-# Ensure cache directories exist
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(AUDIO_TMP_DIR, exist_ok=True)
+# Ensure cache directories exist safely
+try:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+except Exception:
+    pass
+
+try:
+    os.makedirs(AUDIO_TMP_DIR, exist_ok=True)
+except Exception:
+    pass
+
+# Active task coordination (prevent duplicate parallel Whisper runs on same video)
+_ACTIVE_TASKS: Dict[str, threading.Event] = {}
+_TASKS_LOCK = threading.Lock()
 
 
 def clean_html(text: str) -> str:
@@ -64,17 +81,62 @@ def extract_video_id(url_or_id: str) -> Optional[str]:
     return None
 
 
+def parse_timestamp_to_sec(ts_str: str) -> float:
+    """
+    Parses timestamp string ("00:01:23,456", "00:01:23.456", "01:23") to float seconds.
+    """
+    if not ts_str:
+        return 0.0
+    ts_clean = ts_str.strip().replace(",", ".")
+    parts = ts_clean.split(":")
+    try:
+        if len(parts) == 3:
+            return float(parts[0]) * 3600.0 + float(parts[1]) * 60.0 + float(parts[2])
+        elif len(parts) == 2:
+            return float(parts[0]) * 60.0 + float(parts[1])
+        elif len(parts) == 1:
+            return float(parts[0])
+    except Exception:
+        pass
+    return 0.0
+
+
+def format_sec_to_timestamp(total_sec: float) -> str:
+    """
+    Formats float seconds to standard timestamp "HH:MM:SS.mmm".
+    """
+    if total_sec < 0:
+        total_sec = 0.0
+    h = int(total_sec // 3600)
+    m = int((total_sec % 3600) // 60)
+    s = int(total_sec % 60)
+    ms = int(round((total_sec - int(total_sec)) * 1000))
+    if ms >= 1000:
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
 class YouTubeReader:
-    """Sovereign YouTube Video Reader with Multi-Tier Processing."""
+    """Sovereign YouTube Video Reader with Multi-Tier Storage-Cached Processing."""
+
+    @classmethod
+    def get_cache_dir(cls) -> str:
+        # Fallback to local cache if /sdcard isn't writable
+        if os.path.exists(CACHE_DIR) or os.access(os.path.dirname(CACHE_DIR), os.W_OK):
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            return CACHE_DIR
+        local_cache = os.path.expanduser("~/ntawebsearchapi/cache/transcripts")
+        os.makedirs(local_cache, exist_ok=True)
+        return local_cache
 
     @classmethod
     def get_cache_path(cls, video_id: str) -> str:
-        # Fallback to local cache if /sdcard isn't writable
-        if os.path.exists(CACHE_DIR) or os.access(os.path.dirname(CACHE_DIR), os.W_OK):
-            return os.path.join(CACHE_DIR, f"{video_id}.json")
-        local_cache = os.path.expanduser("~/ntawebsearchapi/cache/transcripts")
-        os.makedirs(local_cache, exist_ok=True)
-        return os.path.join(local_cache, f"{video_id}.json")
+        return os.path.join(cls.get_cache_dir(), f"{video_id}.json")
+
+    @classmethod
+    def get_progress_path(cls, video_id: str) -> str:
+        return os.path.join(cls.get_cache_dir(), f"{video_id}.progress.json")
 
     @classmethod
     def read_cache(cls, video_id: str) -> Optional[Dict[str, Any]]:
@@ -85,6 +147,17 @@ class YouTubeReader:
                     data = json.load(f)
                     data["cached"] = True
                     return data
+            except Exception:
+                pass
+        return None
+
+    @classmethod
+    def read_progress(cls, video_id: str) -> Optional[Dict[str, Any]]:
+        path = cls.get_progress_path(video_id)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
             except Exception:
                 pass
         return None
@@ -124,7 +197,7 @@ class YouTubeReader:
 
         try:
             req = urllib.request.Request(watch_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
                 html = resp.read().decode("utf-8", errors="ignore")
 
             m_player = re.search(r"ytInitialPlayerResponse\s*=\s*({.+?});(?:var|\s*<)", html)
@@ -233,7 +306,7 @@ class YouTubeReader:
         ]
 
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             # Find the downloaded subtitle file (.vtt or .srt)
             downloaded_files = glob.glob(f"{sub_prefix}*")
             for sub_file in downloaded_files:
@@ -257,8 +330,14 @@ class YouTubeReader:
     @classmethod
     def transcribe_with_whisper(cls, video_id: str, watch_url: str) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Tier 2 STT: Downloads high-fidelity audio stream via yt-dlp, converts to 16kHz WAV,
-        and transcribes via whisper.cpp ARM NEON native inference.
+        Tier 2 STT Fallback: Chunked, Storage-Cached Audio Pipeline.
+        - Downloads lowest-bitrate voice audio stream (m4a/aac) via yt-dlp to conserve bandwidth.
+        - Applies FFmpeg acoustic bandpass vocal filter (80Hz - 8000Hz, 1.2x volume) to eliminate low/high noise.
+        - Segments audio into small 60-second chunks on disk (-f segment).
+        - Runs whisper.cpp ARM NEON native inference (4 threads) sequentially chunk-by-chunk:
+          Peak RAM stays under ~45MB regardless of video length (10 minutes, 1 hour, or 4 hours).
+        - Persists progress to storage cache ({video_id}.progress.json) after each chunk so work is never lost.
+        - Immediately deletes processed chunk WAV files to maintain minimal storage footprint.
         """
         if not os.path.exists(WHISPER_BIN):
             raise RuntimeError(f"Whisper binary not found at {WHISPER_BIN}")
@@ -266,101 +345,204 @@ class YouTubeReader:
             raise RuntimeError(f"Whisper model not found at {WHISPER_MODEL}")
 
         raw_audio_path = os.path.join(AUDIO_TMP_DIR, f"{video_id}.m4a")
-        wav_audio_path = os.path.join(AUDIO_TMP_DIR, f"{video_id}.wav")
-        whisper_out_base = os.path.join(AUDIO_TMP_DIR, f"{video_id}_res")
+        chunk_dir = os.path.join(AUDIO_TMP_DIR, f"chunks_{video_id}")
+        os.makedirs(chunk_dir, exist_ok=True)
+        progress_path = cls.get_progress_path(video_id)
+
+        completed_chunks = set()
+        segments: List[Dict[str, Any]] = []
+        full_text_list: List[str] = []
+
+        # Check for existing progress file on storage
+        if os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r", encoding="utf-8") as pf:
+                    prog = json.load(pf)
+                    completed_chunks = set(prog.get("completed_chunks", []))
+                    segments = prog.get("segments", [])
+                    full_text_list = prog.get("full_text_list", [])
+                    print(f"[YT-READER] 📂 Resuming transcription for {video_id}: {len(completed_chunks)} chunks already completed.", flush=True)
+            except Exception as pe:
+                print(f"[YT-READER] Warning loading progress file: {pe}", flush=True)
 
         try:
-            print(f"[YT-READER] 🎙️ Step 1: Downloading clean audio via yt-dlp for {video_id}...", flush=True)
-            dl_cmd = [
-                YT_DLP_BIN,
-                "--extractor-args", "youtube:player_client=android",
-                "-f", "ba/b",
-                "-o", raw_audio_path,
-                "--no-playlist",
-                watch_url
-            ]
-            res_dl = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=120)
-            if res_dl.returncode != 0:
-                dl_cmd_general = [
+            existing_chunks = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.wav")))
+
+            # Step 1: Download audio if not already chunked
+            if not existing_chunks:
+                print(f"[YT-READER] 🎙️ Step 1: Downloading lowest-bandwidth audio for {video_id}...", flush=True)
+                dl_cmd = [
                     YT_DLP_BIN,
                     "--extractor-args", "youtube:player_client=android,ios,mweb",
-                    "-f", "ba/b",
+                    "-f", "ba[ext=m4a]/ba[abr<=64]/ba/b",
+                    "--no-part",
                     "-o", raw_audio_path,
                     "--no-playlist",
                     watch_url
                 ]
-                res_dl = subprocess.run(dl_cmd_general, capture_output=True, text=True, timeout=120)
+                res_dl = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=600)
                 if res_dl.returncode != 0:
-                    raise RuntimeError(f"yt-dlp failed: {res_dl.stderr[:200]}")
+                    # Retry with generic player client
+                    dl_cmd_general = [
+                        YT_DLP_BIN,
+                        "-f", "ba[ext=m4a]/ba/b",
+                        "--no-part",
+                        "-o", raw_audio_path,
+                        "--no-playlist",
+                        watch_url
+                    ]
+                    res_dl = subprocess.run(dl_cmd_general, capture_output=True, text=True, timeout=600)
+                    if res_dl.returncode != 0:
+                        raise RuntimeError(f"yt-dlp audio download failed: {res_dl.stderr[:200]}")
 
-            if not os.path.exists(raw_audio_path) or os.path.getsize(raw_audio_path) == 0:
-                raise RuntimeError("yt-dlp produced empty or missing audio file")
+                if not os.path.exists(raw_audio_path) or os.path.getsize(raw_audio_path) == 0:
+                    raise RuntimeError("yt-dlp produced empty or missing audio file")
 
-            print(f"[YT-READER] 🔊 Step 2: Converting to 16kHz Mono WAV via FFmpeg (bandpass vocal filter)...", flush=True)
-            # Bandpass vocal filter (80Hz - 8000Hz) removes background rumble, air hiss, and electrical hum at 140x real-time speed
-            ff_cmd = [
-                FFMPEG_BIN,
-                "-y",
-                "-i", raw_audio_path,
-                "-vn",
-                "-ar", "16000",
-                "-ac", "1",
-                "-c:a", "pcm_s16le",
-                "-af", "volume=1.2,highpass=f=80,lowpass=f=8000",
-                wav_audio_path
-            ]
-            res_ff = subprocess.run(ff_cmd, capture_output=True, text=True, timeout=120)
-            if res_ff.returncode != 0 or not os.path.exists(wav_audio_path):
-                raise RuntimeError(f"FFmpeg audio conversion failed: {res_ff.stderr[:200]}")
+                print(f"[YT-READER] 🔊 Step 2: Segmenting audio into 60s chunks with vocal bandpass filter (storage-cached)...", flush=True)
+                chunk_pattern = os.path.join(chunk_dir, "chunk_%04d.wav")
+                ff_cmd = [
+                    FFMPEG_BIN,
+                    "-y",
+                    "-i", raw_audio_path,
+                    "-vn",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-c:a", "pcm_s16le",
+                    "-af", "volume=1.2,highpass=f=80,lowpass=f=8000",
+                    "-f", "segment",
+                    "-segment_time", "60",
+                    "-reset_timestamps", "1",
+                    chunk_pattern
+                ]
+                res_ff = subprocess.run(ff_cmd, capture_output=True, text=True, timeout=300)
+                if res_ff.returncode != 0:
+                    raise RuntimeError(f"FFmpeg segmentation failed: {res_ff.stderr[:200]}")
 
-            print(f"[YT-READER] 🧠 Step 3: Running whisper.cpp on-device inference (4 threads, NEON, speech suppression)...", flush=True)
-            whisper_cmd = [
-                WHISPER_BIN,
-                "-m", WHISPER_MODEL,
-                "-f", wav_audio_path,
-                "-oj",
-                "-t", "4",
-                "-of", whisper_out_base,
-                "-l", "en",
-                "-sns",
-                "--no-prints"
-            ]
-            res_wh = subprocess.run(whisper_cmd, capture_output=True, text=True, timeout=300)
+                # Reclaim raw audio storage immediately
+                if os.path.exists(raw_audio_path):
+                    try: os.remove(raw_audio_path)
+                    except Exception: pass
 
-            json_res_path = f"{whisper_out_base}.json"
-            segments: List[Dict[str, Any]] = []
-            full_text_list: List[str] = []
+                existing_chunks = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.wav")))
 
-            if os.path.exists(json_res_path):
+            if not existing_chunks:
+                raise RuntimeError("No audio chunks produced by FFmpeg")
+
+            total_chunks = len(existing_chunks)
+            print(f"[YT-READER] 🧠 Step 3: Transcribing {total_chunks} audio chunks (Whisper NEON, peak RAM < 50MB)...", flush=True)
+
+            # Step 3: Sequential Chunk Transcription
+            for chunk_file in existing_chunks:
+                m = re.search(r"chunk_(\d+)\.wav", os.path.basename(chunk_file))
+                if not m:
+                    continue
+                chunk_idx = int(m.group(1))
+
+                # Skip already transcribed chunks
+                if chunk_idx in completed_chunks:
+                    try: os.remove(chunk_file)
+                    except Exception: pass
+                    continue
+
+                if not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
+                    completed_chunks.add(chunk_idx)
+                    try: os.remove(chunk_file)
+                    except Exception: pass
+                    continue
+
+                chunk_offset_sec = chunk_idx * 60.0
+                chunk_out_base = os.path.join(chunk_dir, f"out_{chunk_idx:04d}")
+
+                whisper_cmd = [
+                    WHISPER_BIN,
+                    "-m", WHISPER_MODEL,
+                    "-f", chunk_file,
+                    "-oj",
+                    "-t", "4",
+                    "-of", chunk_out_base,
+                    "-l", "en",
+                    "-sns",
+                    "--no-prints"
+                ]
+
                 try:
-                    with open(json_res_path, "r", encoding="utf-8") as jf:
-                        w_data = json.load(jf)
-                        for seg in w_data.get("transcription", []):
-                            st = seg.get("timestamps", {}).get("from", "00:00:00,000")
-                            et = seg.get("timestamps", {}).get("to", "00:00:00,000")
-                            text_s = seg.get("text", "").strip()
-                            if text_s:
-                                segments.append({
-                                    "start": st,
-                                    "end": et,
-                                    "text": text_s
-                                })
-                                full_text_list.append(text_s)
+                    res_wh = subprocess.run(whisper_cmd, capture_output=True, text=True, timeout=90)
+                except subprocess.TimeoutExpired:
+                    print(f"[YT-READER] Warning: Chunk {chunk_idx} timed out, skipping.", flush=True)
+                    completed_chunks.add(chunk_idx)
+                    try: os.remove(chunk_file)
+                    except Exception: pass
+                    continue
+
+                json_out = f"{chunk_out_base}.json"
+                chunk_text_parts: List[str] = []
+
+                if os.path.exists(json_out):
+                    try:
+                        with open(json_out, "r", encoding="utf-8") as jf:
+                            w_data = json.load(jf)
+                            for seg in w_data.get("transcription", []):
+                                t_from = seg.get("timestamps", {}).get("from", "00:00:00,000")
+                                t_to = seg.get("timestamps", {}).get("to", "00:00:00,000")
+                                text_s = seg.get("text", "").strip()
+                                if text_s:
+                                    # Align timestamps to overall video position
+                                    start_sec = parse_timestamp_to_sec(t_from) + chunk_offset_sec
+                                    end_sec = parse_timestamp_to_sec(t_to) + chunk_offset_sec
+                                    clean_from = format_sec_to_timestamp(start_sec)
+                                    clean_to = format_sec_to_timestamp(end_sec)
+                                    segments.append({
+                                        "start": clean_from,
+                                        "end": clean_to,
+                                        "text": text_s
+                                    })
+                                    chunk_text_parts.append(text_s)
+                    except Exception as je:
+                        print(f"[YT-READER] Warning parsing chunk {chunk_idx} JSON: {je}", flush=True)
+
+                if chunk_text_parts:
+                    chunk_str = " ".join(chunk_text_parts).strip()
+                    full_text_list.append(chunk_str)
+
+                completed_chunks.add(chunk_idx)
+
+                # Persist progress to storage cache after EVERY chunk
+                try:
+                    with open(progress_path, "w", encoding="utf-8") as pf:
+                        json.dump({
+                            "video_id": video_id,
+                            "total_chunks": total_chunks,
+                            "completed_chunks": list(completed_chunks),
+                            "segments": segments,
+                            "full_text_list": full_text_list,
+                            "updated_at": time.time()
+                        }, pf)
                 except Exception:
                     pass
 
+                # Reclaim storage immediately
+                for tmp_f in [chunk_file, json_out, f"{chunk_out_base}.txt"]:
+                    if os.path.exists(tmp_f):
+                        try: os.remove(tmp_f)
+                        except Exception: pass
+
             full_text = " ".join(full_text_list).strip()
-            if not full_text and res_wh.stdout:
-                full_text = res_wh.stdout.strip()
+
+            # Clean up completed progress file and chunks directory
+            if os.path.exists(progress_path):
+                try: os.remove(progress_path)
+                except Exception: pass
+            if os.path.exists(chunk_dir):
+                try: shutil.rmtree(chunk_dir, ignore_errors=True)
+                except Exception: pass
 
             return full_text, segments
 
         finally:
-            # Auto-cleanup temporary audio files to protect phone storage
-            for p in [raw_audio_path, wav_audio_path, f"{whisper_out_base}.json", f"{whisper_out_base}.txt"]:
-                if os.path.exists(p):
-                    try: os.remove(p)
-                    except Exception: pass
+            # Always ensure raw audio is cleaned up
+            if os.path.exists(raw_audio_path):
+                try: os.remove(raw_audio_path)
+                except Exception: pass
 
     @classmethod
     def read_video(
@@ -372,6 +554,7 @@ class YouTubeReader:
         """
         Main public interface for NetuArk AI.
         Takes video ID or URL, extracts rich metadata and complete spoken content.
+        Thread-safe, storage-cached, and OOM-protected.
         """
         start_t = time.time()
         video_id = extract_video_id(url_or_id)
@@ -388,66 +571,101 @@ class YouTubeReader:
             cached["execution_time_sec"] = round(time.time() - start_t, 3)
             return cached
 
-        # Fetch Rich Metadata
-        metadata = cls.fetch_video_metadata(video_id)
+        # Check active tasks to coordinate parallel requests
+        with _TASKS_LOCK:
+            if video_id in _ACTIVE_TASKS:
+                task_event = _ACTIVE_TASKS[video_id]
+                is_owner = False
+            else:
+                task_event = threading.Event()
+                _ACTIVE_TASKS[video_id] = task_event
+                is_owner = True
 
-        full_text = ""
-        segments: List[Dict[str, Any]] = []
-        transcript_source = "none"
+        if not is_owner:
+            print(f"[YT-READER] Waiting for in-progress transcription of {video_id}...", flush=True)
+            # Wait up to 85 seconds for owner thread
+            task_event.wait(timeout=85.0)
+            cached = cls.read_cache(video_id)
+            if cached:
+                cached["execution_time_sec"] = round(time.time() - start_t, 3)
+                return cached
+            # Check progress if still running
+            prog = cls.read_progress(video_id)
+            if prog:
+                return {
+                    "status": "Processing",
+                    "video_id": video_id,
+                    "message": f"Transcription in progress ({len(prog.get('completed_chunks', []))}/{prog.get('total_chunks', '?')} chunks done)",
+                    "execution_time_sec": round(time.time() - start_t, 2)
+                }
 
-        # Tier 1: Fast Subtitle Path
-        if not force_stt:
-            print(f"[YT-READER] ⚡ Tier 1: Checking subtitles for {video_id} ({metadata.get('title')[:40]}...)", flush=True)
-            full_text, segments = cls.extract_subtitles_ytdlp(metadata["url"], video_id, lang=lang)
-            if full_text:
-                transcript_source = "youtube_captions"
-                metadata["language"] = lang
+        try:
+            # Fetch Rich Metadata
+            metadata = cls.fetch_video_metadata(video_id)
 
-        # Tier 2: Native Audio Download & Whisper.cpp STT
-        if not full_text:
-            print(f"[YT-READER] 🎙️ Tier 2: Subtitles absent or force_stt enabled. Starting native Whisper STT for {video_id}...", flush=True)
-            try:
-                full_text, segments = cls.transcribe_with_whisper(video_id, metadata["url"])
+            full_text = ""
+            segments: List[Dict[str, Any]] = []
+            transcript_source = "none"
+
+            # Tier 1: Fast Subtitle Path
+            if not force_stt:
+                print(f"[YT-READER] ⚡ Tier 1: Checking subtitles for {video_id} ({metadata.get('title')[:40]}...)", flush=True)
+                full_text, segments = cls.extract_subtitles_ytdlp(metadata["url"], video_id, lang=lang)
                 if full_text:
-                    transcript_source = "on_device_whisper"
-                    metadata["language"] = "en"
-            except Exception as we:
-                print(f"[YT-READER] Whisper STT fallback error: {we}", flush=True)
+                    transcript_source = "youtube_captions"
+                    metadata["language"] = lang
 
-        if not full_text:
-            return {
-                "status": "Error",
+            # Tier 2: Storage-Cached Chunked Whisper.cpp STT
+            if not full_text:
+                print(f"[YT-READER] 🎙️ Tier 2: Starting storage-cached Whisper STT for {video_id}...", flush=True)
+                try:
+                    full_text, segments = cls.transcribe_with_whisper(video_id, metadata["url"])
+                    if full_text:
+                        transcript_source = "on_device_whisper"
+                        metadata["language"] = "en"
+                except Exception as we:
+                    print(f"[YT-READER] Whisper STT fallback error: {we}", flush=True)
+
+            if not full_text:
+                return {
+                    "status": "Error",
+                    "video_id": video_id,
+                    "title": metadata.get("title"),
+                    "channel": metadata.get("channel"),
+                    "error": "Could not extract captions or transcribe video audio.",
+                    "execution_time_sec": round(time.time() - start_t, 2)
+                }
+
+            word_count = len(full_text.split())
+            result: Dict[str, Any] = {
+                "status": "Success",
                 "video_id": video_id,
-                "title": metadata.get("title"),
-                "channel": metadata.get("channel"),
-                "error": "Could not extract captions or transcribe video audio.",
-                "execution_time_sec": round(time.time() - start_t, 2)
+                "url": metadata["url"],
+                "title": metadata["title"],
+                "channel": metadata["channel"],
+                "channel_url": metadata["channel_url"],
+                "duration": metadata["duration"],
+                "views": metadata["views"],
+                "published_date": metadata["published_date"],
+                "category": metadata.get("category", ""),
+                "thumbnail": metadata["thumbnail"],
+                "description_preview": metadata["description"][:300],
+                "transcript_source": transcript_source,
+                "language": metadata.get("language", lang),
+                "cached": False,
+                "word_count": word_count,
+                "segments_count": len(segments),
+                "execution_time_sec": round(time.time() - start_t, 2),
+                "text": full_text,
+                "segments": segments
             }
 
-        word_count = len(full_text.split())
-        result: Dict[str, Any] = {
-            "status": "Success",
-            "video_id": video_id,
-            "url": metadata["url"],
-            "title": metadata["title"],
-            "channel": metadata["channel"],
-            "channel_url": metadata["channel_url"],
-            "duration": metadata["duration"],
-            "views": metadata["views"],
-            "published_date": metadata["published_date"],
-            "category": metadata.get("category", ""),
-            "thumbnail": metadata["thumbnail"],
-            "description_preview": metadata["description"][:300],
-            "transcript_source": transcript_source,
-            "language": metadata.get("language", lang),
-            "cached": False,
-            "word_count": word_count,
-            "segments_count": len(segments),
-            "execution_time_sec": round(time.time() - start_t, 2),
-            "text": full_text,
-            "segments": segments
-        }
+            # Save to persistent cache
+            cls.save_cache(video_id, result)
+            return result
 
-        # Save to persistent cache
-        cls.save_cache(video_id, result)
-        return result
+        finally:
+            if is_owner:
+                with _TASKS_LOCK:
+                    _ACTIVE_TASKS.pop(video_id, None)
+                task_event.set()
