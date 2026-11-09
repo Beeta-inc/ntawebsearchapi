@@ -398,11 +398,13 @@ class YouTubeReader:
                 if not os.path.exists(raw_audio_path) or os.path.getsize(raw_audio_path) == 0:
                     raise RuntimeError("yt-dlp produced empty or missing audio file")
 
-                print(f"[YT-READER] 🔊 Step 2: Segmenting audio into 60s chunks with vocal bandpass filter (storage-cached)...", flush=True)
+                cpu_threads = str(os.cpu_count() or 8)
+                print(f"[YT-READER] 🔊 Step 2: Segmenting audio into 60s chunks with {cpu_threads}-core acceleration & vocal bandpass filter...", flush=True)
                 chunk_pattern = os.path.join(chunk_dir, "chunk_%04d.wav")
                 ff_cmd = [
                     FFMPEG_BIN,
                     "-y",
+                    "-threads", cpu_threads,
                     "-i", raw_audio_path,
                     "-vn",
                     "-ar", "16000",
@@ -453,12 +455,13 @@ class YouTubeReader:
                 chunk_offset_sec = chunk_idx * 60.0
                 chunk_out_base = os.path.join(chunk_dir, f"out_{chunk_idx:04d}")
 
+                cpu_threads = str(os.cpu_count() or 8)
                 whisper_cmd = [
                     WHISPER_BIN,
                     "-m", WHISPER_MODEL,
                     "-f", chunk_file,
                     "-oj",
-                    "-t", "4",
+                    "-t", cpu_threads,
                     "-of", chunk_out_base,
                     "-l", "en",
                     "-sns",
