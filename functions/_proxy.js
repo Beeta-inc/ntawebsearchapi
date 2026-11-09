@@ -148,7 +148,7 @@ export async function handleRequest(context) {
       message: "Tunnel is reconnecting to phone server. Please retry in a few seconds.",
       retry_after_sec: 2
     }), {
-      status: 503,
+      status: 200,
       headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Retry-After": "2" }
     });
   }

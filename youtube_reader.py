@@ -455,7 +455,7 @@ class YouTubeReader:
                 chunk_offset_sec = chunk_idx * 60.0
                 chunk_out_base = os.path.join(chunk_dir, f"out_{chunk_idx:04d}")
 
-                cpu_threads = str(os.cpu_count() or 8)
+                cpu_threads = str(min(6, os.cpu_count() or 6))
                 whisper_cmd = [
                     WHISPER_BIN,
                     "-m", WHISPER_MODEL,
@@ -548,6 +548,43 @@ class YouTubeReader:
                 except Exception: pass
 
     @classmethod
+    def _run_whisper_background(cls, video_id: str, metadata: Dict[str, Any], task_event: threading.Event) -> None:
+        """Background worker executing Zero-OOM sequential chunked Whisper STT."""
+        try:
+            print(f"[YT-READER] 🎙️ Background STT started for {video_id} ({metadata.get('title', '')[:30]})...", flush=True)
+            full_text, segments = cls.transcribe_with_whisper(video_id, metadata["url"])
+            if full_text:
+                result = {
+                    "status": "Success",
+                    "video_id": video_id,
+                    "url": metadata["url"],
+                    "title": metadata["title"],
+                    "channel": metadata["channel"],
+                    "channel_url": metadata["channel_url"],
+                    "duration": metadata["duration"],
+                    "views": metadata["views"],
+                    "published_date": metadata["published_date"],
+                    "category": metadata.get("category", ""),
+                    "thumbnail": metadata["thumbnail"],
+                    "description_preview": metadata.get("description", "")[:300],
+                    "transcript_source": "on_device_whisper",
+                    "language": "en",
+                    "cached": False,
+                    "word_count": len(full_text.split()),
+                    "segments_count": len(segments),
+                    "text": full_text,
+                    "segments": segments
+                }
+                cls.save_cache(video_id, result)
+                print(f"[YT-READER] ✅ Background STT completed and cached for {video_id}!", flush=True)
+        except Exception as e:
+            print(f"[YT-READER] ❌ Background STT worker failed for {video_id}: {e}", flush=True)
+        finally:
+            with _TASKS_LOCK:
+                _ACTIVE_TASKS.pop(video_id, None)
+            task_event.set()
+
+    @classmethod
     def read_video(
         cls,
         url_or_id: str,
@@ -557,7 +594,7 @@ class YouTubeReader:
         """
         Main public interface for NetuArk AI.
         Takes video ID or URL, extracts rich metadata and complete spoken content.
-        Thread-safe, storage-cached, and OOM-protected.
+        Thread-safe, non-blocking, storage-cached, and OOM-protected.
         """
         start_t = time.time()
         video_id = extract_video_id(url_or_id)
@@ -568,13 +605,13 @@ class YouTubeReader:
                 "execution_time_sec": 0.0
             }
 
-        # Check Cache first
+        # 1. Check Cache first
         cached = cls.read_cache(video_id)
         if cached and not force_stt:
             cached["execution_time_sec"] = round(time.time() - start_t, 3)
             return cached
 
-        # Check active tasks to coordinate parallel requests
+        # 2. Check if already running in background
         with _TASKS_LOCK:
             if video_id in _ACTIVE_TASKS:
                 task_event = _ACTIVE_TASKS[video_id]
@@ -585,90 +622,105 @@ class YouTubeReader:
                 is_owner = True
 
         if not is_owner:
-            print(f"[YT-READER] Waiting for in-progress transcription of {video_id}...", flush=True)
-            # Wait up to 85 seconds for owner thread
-            task_event.wait(timeout=85.0)
+            # Short wait (up to 3.5s) in case it just finished
+            task_event.wait(timeout=3.5)
             cached = cls.read_cache(video_id)
             if cached:
                 cached["execution_time_sec"] = round(time.time() - start_t, 3)
                 return cached
-            # Check progress if still running
-            prog = cls.read_progress(video_id)
-            if prog:
-                return {
-                    "status": "Processing",
-                    "video_id": video_id,
-                    "message": f"Transcription in progress ({len(prog.get('completed_chunks', []))}/{prog.get('total_chunks', '?')} chunks done)",
-                    "execution_time_sec": round(time.time() - start_t, 2)
-                }
 
+            prog = cls.read_progress(video_id) or {}
+            completed = len(prog.get("completed_chunks", []))
+            total = prog.get("total_chunks", 0)
+            pct = int((completed / max(total, 1)) * 100) if total else 0
+            return {
+                "status": "Processing",
+                "video_id": video_id,
+                "message": f"Transcribing audio with on-device Whisper ({completed}/{total or '?'} chunks, {pct}% done)...",
+                "completed_chunks": completed,
+                "total_chunks": total,
+                "progress_percent": pct,
+                "execution_time_sec": round(time.time() - start_t, 2)
+            }
+
+        # 3. New Owner: First fetch metadata
         try:
-            # Fetch Rich Metadata
             metadata = cls.fetch_video_metadata(video_id)
 
-            full_text = ""
-            segments: List[Dict[str, Any]] = []
-            transcript_source = "none"
-
-            # Tier 1: Fast Subtitle Path
+            # Tier 1: Fast Subtitle Path (1-3s, 0% CPU)
             if not force_stt:
                 print(f"[YT-READER] ⚡ Tier 1: Checking subtitles for {video_id} ({metadata.get('title')[:40]}...)", flush=True)
                 full_text, segments = cls.extract_subtitles_ytdlp(metadata["url"], video_id, lang=lang)
                 if full_text:
-                    transcript_source = "youtube_captions"
-                    metadata["language"] = lang
+                    word_count = len(full_text.split())
+                    result: Dict[str, Any] = {
+                        "status": "Success",
+                        "video_id": video_id,
+                        "url": metadata["url"],
+                        "title": metadata["title"],
+                        "channel": metadata["channel"],
+                        "channel_url": metadata["channel_url"],
+                        "duration": metadata["duration"],
+                        "views": metadata["views"],
+                        "published_date": metadata["published_date"],
+                        "category": metadata.get("category", ""),
+                        "thumbnail": metadata["thumbnail"],
+                        "description_preview": metadata["description"][:300],
+                        "transcript_source": "youtube_captions",
+                        "language": lang,
+                        "cached": False,
+                        "word_count": word_count,
+                        "segments_count": len(segments),
+                        "execution_time_sec": round(time.time() - start_t, 2),
+                        "text": full_text,
+                        "segments": segments
+                    }
+                    cls.save_cache(video_id, result)
+                    with _TASKS_LOCK:
+                        _ACTIVE_TASKS.pop(video_id, None)
+                    task_event.set()
+                    return result
 
-            # Tier 2: Storage-Cached Chunked Whisper.cpp STT
-            if not full_text:
-                print(f"[YT-READER] 🎙️ Tier 2: Starting storage-cached Whisper STT for {video_id}...", flush=True)
-                try:
-                    full_text, segments = cls.transcribe_with_whisper(video_id, metadata["url"])
-                    if full_text:
-                        transcript_source = "on_device_whisper"
-                        metadata["language"] = "en"
-                except Exception as we:
-                    print(f"[YT-READER] Whisper STT fallback error: {we}", flush=True)
+            # Tier 2: Storage-Cached Chunked Whisper.cpp STT in Dedicated Background Worker
+            print(f"[YT-READER] 🎙️ Tier 2: Launching background Whisper STT worker for {video_id}...", flush=True)
+            worker_thread = threading.Thread(
+                target=cls._run_whisper_background,
+                args=(video_id, metadata, task_event),
+                daemon=True
+            )
+            worker_thread.start()
 
-            if not full_text:
-                return {
-                    "status": "Error",
-                    "video_id": video_id,
-                    "title": metadata.get("title"),
-                    "channel": metadata.get("channel"),
-                    "error": "Could not extract captions or transcribe video audio.",
-                    "execution_time_sec": round(time.time() - start_t, 2)
-                }
+            # Wait up to 5 seconds for fast short clips
+            task_event.wait(timeout=5.0)
 
-            word_count = len(full_text.split())
-            result: Dict[str, Any] = {
-                "status": "Success",
+            # Check if finished within 5s
+            cached = cls.read_cache(video_id)
+            if cached:
+                cached["execution_time_sec"] = round(time.time() - start_t, 3)
+                return cached
+
+            # Return Processing status with HTTP 200 immediately — Cloudflare will never time out!
+            prog = cls.read_progress(video_id) or {}
+            completed = len(prog.get("completed_chunks", []))
+            total = prog.get("total_chunks", 0)
+            pct = int((completed / max(total, 1)) * 100) if total else 0
+            return {
+                "status": "Processing",
                 "video_id": video_id,
-                "url": metadata["url"],
-                "title": metadata["title"],
-                "channel": metadata["channel"],
-                "channel_url": metadata["channel_url"],
-                "duration": metadata["duration"],
-                "views": metadata["views"],
-                "published_date": metadata["published_date"],
-                "category": metadata.get("category", ""),
-                "thumbnail": metadata["thumbnail"],
-                "description_preview": metadata["description"][:300],
-                "transcript_source": transcript_source,
-                "language": metadata.get("language", lang),
-                "cached": False,
-                "word_count": word_count,
-                "segments_count": len(segments),
-                "execution_time_sec": round(time.time() - start_t, 2),
-                "text": full_text,
-                "segments": segments
+                "message": f"Transcribing audio with on-device Whisper ({completed}/{total or '?'} chunks done)...",
+                "completed_chunks": completed,
+                "total_chunks": total,
+                "progress_percent": pct,
+                "execution_time_sec": round(time.time() - start_t, 2)
             }
 
-            # Save to persistent cache
-            cls.save_cache(video_id, result)
-            return result
-
-        finally:
-            if is_owner:
-                with _TASKS_LOCK:
-                    _ACTIVE_TASKS.pop(video_id, None)
-                task_event.set()
+        except Exception as e:
+            with _TASKS_LOCK:
+                _ACTIVE_TASKS.pop(video_id, None)
+            task_event.set()
+            return {
+                "status": "Error",
+                "video_id": video_id,
+                "error": f"Failed initiating video read: {e}",
+                "execution_time_sec": round(time.time() - start_t, 2)
+            }
